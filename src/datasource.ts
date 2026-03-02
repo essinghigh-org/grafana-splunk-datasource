@@ -661,7 +661,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
         data: data,
       }) as any)
     );
-    const sid: string = (response.data as any).sid;
+    const sid: string = (response.data as any)?.sid ?? '';
     if (sid.length > 0) {
       const isComplete = await this.waitForSearchCompletion(sid);
       if (!isComplete) {

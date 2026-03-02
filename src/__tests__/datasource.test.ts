@@ -375,6 +375,41 @@ describe('DataSource runtime polling', () => {
       )
     ).rejects.toBe(expectedError);
   });
+
+  it('throws explicit chain SID error when job creation response omits sid', async () => {
+    const datasource = createDataSource();
+    const fetchMock = jest.fn().mockReturnValue(of({ data: {} }));
+    mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
+    const waitSpy = jest.spyOn(datasource as any, 'waitForSearchCompletion');
+    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+
+    const baseSearch = {
+      sid: 'sid-base',
+      searchId: 'base-search',
+      refId: 'A',
+      fields: ['host'],
+      results: [{ host: 'api-1' }],
+      timestamp: Date.now(),
+      cacheKey: 'base-cache-key',
+    };
+
+    let thrown: unknown;
+    try {
+      await datasource.doChainRequest(
+        { refId: 'B', queryText: '| stats count by host', searchType: 'chain' } as any,
+        createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
+        baseSearch
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown).not.toBeInstanceOf(TypeError);
+    expect((thrown as Error).message).toBe('Chain search failed to return a SID (refId=B).');
+    expect(waitSpy).not.toHaveBeenCalled();
+    expect(getAllSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('DataSource base-search state isolation', () => {
