@@ -42,9 +42,22 @@ by an administrator from Grafana's UI `Configuration --> Datasources --> Add dat
 
 > **NOTE:** By default Splunk's REST API is only available via HTTPS (even if you allow HTTP access on a differen port), usually on: https://splunk:8089
 
-(Example configuration via the Grafana WebUI (Grafana 11.6.1):
+(Example configuration via the Grafana WebUI (Grafana 12.x):
 
 <img src="https://github.com/user-attachments/assets/a5790b24-e1d8-4ed7-8f52-fa6e2df0d511" width="50%" />
+
+## Development verification
+
+- Use `yarn start` (or `yarn watch`) for local frontend watch builds.
+- Use `yarn server` to launch the local Grafana environment (defaults to `GRAFANA_VERSION=12.0.0`, configurable via env var).
+- Before opening a PR, run the same checks gated in CI:
+
+```bash
+yarn lint
+yarn typecheck
+yarn test
+yarn build
+```
 
 ## Testing in Grafana:
 
