@@ -1,3 +1,8 @@
+## 417ee0a (2026-03-02)
+
+fix(merge): integrate grafana compatibility
+
+
 ## b059b15 (2026-03-02)
 
 chore(deps-dev): bump webpack from 5.99.9 to 5.104.1 (#16)
