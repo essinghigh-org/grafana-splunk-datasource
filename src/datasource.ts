@@ -1,7 +1,8 @@
 import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
-import { lastValueFrom } from 'rxjs';
+import { from, lastValueFrom } from 'rxjs';
 
 import {
+  CustomVariableSupport,
   DataQueryRequest,
   DataQueryResponse,
   DataSourceApi,
@@ -13,13 +14,37 @@ import {
 } from '@grafana/data';
 
 import { SplunkQuery, SplunkDataSourceOptions, defaultQueryRequestResults, QueryRequestResults, BaseSearchResult } from './types';
+import { SplunkVariableQuery, VariableQueryEditor } from './VariableQueryEditor';
 
 const baseSearchCache: Map<string, BaseSearchResult> = new Map();
 const baseSearchInflight: Map<string, Promise<BaseSearchResult>> = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
 const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
 
-type VariableQueryInput = SplunkQuery | string | Record<string, unknown>;
+type VariableQueryInput = SplunkQuery | SplunkVariableQuery | string | Record<string, unknown>;
+
+class SplunkCustomVariableSupport extends CustomVariableSupport<
+  DataSource,
+  SplunkVariableQuery,
+  SplunkQuery,
+  SplunkDataSourceOptions
+> {
+  editor = VariableQueryEditor;
+
+  constructor(private readonly datasource: DataSource) {
+    super();
+  }
+
+  query(request: DataQueryRequest<SplunkVariableQuery>) {
+    const variableQuery = request.targets?.[0] ?? '';
+
+    return from(
+      this.datasource
+        .metricFindQuery(variableQuery, request as unknown as DataQueryRequest<SplunkQuery>)
+        .then((metricFindValues) => ({ data: metricFindValues }))
+    );
+  }
+}
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -44,6 +69,7 @@ function generateCacheKey(query: SplunkQuery, options: DataQueryRequest<SplunkQu
 
 export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptions> {
   url?: string;
+  variables = new SplunkCustomVariableSupport(this);
 
   constructor(instanceSettings: DataSourceInstanceSettings<SplunkDataSourceOptions>) {
     super(instanceSettings);
@@ -113,6 +139,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const mode = queryRecord.mode === 'base' || queryRecord.mode === 'chain' ? queryRecord.mode : undefined;
 
     return {
+      ...(queryRecord as Partial<SplunkQuery>),
       refId: typeof queryRecord.refId === 'string' && queryRecord.refId.length > 0 ? queryRecord.refId : 'metricFindQuery',
       queryText,
       searchType,
