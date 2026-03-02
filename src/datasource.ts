@@ -18,6 +18,9 @@ import { SplunkVariableQuery, VariableQueryEditor } from './VariableQueryEditor'
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
 const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
+const MAX_QUERY_EXECUTION_CONCURRENCY = 4;
+const CHAIN_BASE_SEARCH_RETRY_ATTEMPTS = 3;
+const CHAIN_BASE_SEARCH_RETRY_DELAY_MS = 100;
 const SEARCH_POLL_INTERVAL_MS = 100;
 const SEARCH_POLL_TIMEOUT_MS = 30 * 1000;
 const SEARCH_TIMEOUT_ERROR_CODE = 'SPLUNK_SEARCH_TIMEOUT';
@@ -36,6 +39,75 @@ class SplunkSearchTimeoutError extends Error {
 }
 
 type VariableQueryInput = SplunkQuery | SplunkVariableQuery | string | Record<string, unknown>;
+type EffectiveSearchType = NonNullable<SplunkQuery['searchType']>;
+
+const isSearchType = (value: unknown): value is EffectiveSearchType =>
+  value === 'standard' || value === 'base' || value === 'chain';
+
+const isLegacyMode = (value: unknown): value is NonNullable<SplunkQuery['mode']> => value === 'base' || value === 'chain';
+
+const resolveSearchType = (searchType: unknown, mode: unknown): EffectiveSearchType => {
+  if (isSearchType(searchType)) {
+    return searchType;
+  }
+
+  if (isLegacyMode(mode)) {
+    return mode;
+  }
+
+  return 'standard';
+};
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+};
+
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> => {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const boundedLimit = Math.max(1, Math.min(limit, items.length));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  };
+
+  await Promise.all(Array.from({ length: boundedLimit }, () => worker()));
+  return results;
+};
+
+export const resetBaseSearchStateForTests = () => {
+  // Base-search cache state is scoped to each DataSource instance.
+  // This helper is intentionally a no-op to preserve test compatibility.
+};
 
 class SplunkCustomVariableSupport extends CustomVariableSupport<
   DataSource,
@@ -148,11 +220,8 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       return null;
     }
 
-    const searchType =
-      queryRecord.searchType === 'base' || queryRecord.searchType === 'chain' || queryRecord.searchType === 'standard'
-        ? queryRecord.searchType
-        : 'standard';
-    const mode = queryRecord.mode === 'base' || queryRecord.mode === 'chain' ? queryRecord.mode : undefined;
+    const searchType = resolveSearchType(queryRecord.searchType, queryRecord.mode);
+    const mode = isLegacyMode(queryRecord.mode) ? queryRecord.mode : undefined;
 
     return {
       ...(queryRecord as Partial<SplunkQuery>),
@@ -193,166 +262,183 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     // Clean up stale cache entries periodically
     this.cleanupStaleCache();
     
-    const standardSearches = options.targets.filter(query => query.searchType === 'standard' || !query.searchType);
-    const baseSearches = options.targets.filter(query => query.searchType === 'base');
-    const chainSearches = options.targets.filter(query => query.searchType === 'chain');
+    const standardSearches = options.targets.filter(query => this.resolveQuerySearchType(query) === 'standard');
+    const baseSearches = options.targets.filter(query => this.resolveQuerySearchType(query) === 'base');
+    const chainSearches = options.targets.filter(query => this.resolveQuerySearchType(query) === 'chain');
 
-    // Handle standard searches first - these are independent
-    const standardResults: any[] = [];
-    for (const query of standardSearches) {
-      const result = await this.doRequest(query, options);
-      standardResults.push(this.createDataFrame(query, result));
-    }
-
-    const baseSearchPromises: Array<Promise<BaseSearchResult>> = [];
-    const baseResults: any[] = [];
-
-    for (const query of baseSearches) {
-      const cacheKey = generateCacheKey(query, options);
-      const primaryKey = query.refId; // For compatibility with chain searches
-      const searchIdKey = query.searchId;
-
-      // 1. Check cache first using the proper cache key
-      let cachedResult = this.findBaseSearchResult(cacheKey);
-
-      if (cachedResult) {
-        baseSearchPromises.push(Promise.resolve(cachedResult));
-      } else {
-        // 2. Check for existing in-flight promise
-        let inflightPromise = this.baseSearchInflight.get(cacheKey);
-
-        if (inflightPromise) {
-          baseSearchPromises.push(inflightPromise);
-        } else {
-          // 3. No cached result, no in-flight promise: Execute new search
-          const executeAndCacheBaseSearch = async (): Promise<BaseSearchResult> => {
-            const result = await this.doRequest(query, options);
-            const baseResult: BaseSearchResult = {
-              sid: result.sid || '',
-              searchId: query.searchId || query.refId, // Ensure searchId is populated
-              refId: query.refId,
-              fields: result.fields,
-              results: result.results,
-              timestamp: Date.now(),
-              cacheKey: cacheKey, // Store the cache key for reference
-            };
-            
-            // Store in cache with the proper cache key
-            this.baseSearchCache.set(cacheKey, baseResult);
-            // Also store with refId and searchId for chain search compatibility
-            this.baseSearchCache.set(query.refId, baseResult);
-            if (query.searchId) {
-              this.baseSearchCache.set(query.searchId, baseResult);
-            }
-            return baseResult;
-          };
-
-          let newPromise = executeAndCacheBaseSearch();
-
-          // Wrap promise with finally for cleanup
-          newPromise = newPromise.finally(() => {
-            this.baseSearchInflight.delete(cacheKey);
-            this.baseSearchInflight.delete(primaryKey);
-            if (searchIdKey) {
-              this.baseSearchInflight.delete(searchIdKey);
-            }
-          });
-
-          this.baseSearchInflight.set(cacheKey, newPromise);
-          this.baseSearchInflight.set(primaryKey, newPromise);
-          if (searchIdKey) {
-            this.baseSearchInflight.set(searchIdKey, newPromise);
-          }
-          baseSearchPromises.push(newPromise);
-        }
-      }
-    }
-
-    const completedBaseSearchResults = await Promise.all(baseSearchPromises);
-
-    for (const completedResult of completedBaseSearchResults) {
-      // Find the original query corresponding to the result.
-      // This is important because query options (like refId) are needed for createDataFrame.
-      const originalQuery = baseSearches.find(q => q.refId === completedResult.refId || (completedResult.searchId && q.searchId === completedResult.searchId));
-      if (originalQuery) {
-        const dataFrame = this.createDataFrame(originalQuery, { fields: completedResult.fields, results: completedResult.results, sid: completedResult.sid });
-        baseResults.push(dataFrame);
-      } else {
-        // This case should ideally not happen if logic is correct
-      }
-    }
-    
-    
-    // Now execute chain searches
-    const chainResults: any[] = [];
-    for (const query of chainSearches) {
-      if (query.baseSearchRefId) {
-        let baseSearch = this.findBaseSearchResultByRefId(query.baseSearchRefId);
-
-        if (!baseSearch || !this.isCacheValid(baseSearch)) {
-          let awaitedBaseSearch: BaseSearchResult | null = null;
-          let inflightPromise: Promise<BaseSearchResult> | undefined = undefined;
-          const maxRetries = 3;
-          const retryDelayMs = 100;
-
-          for (let attempt = 0; attempt < maxRetries; attempt++) {
-            // Attempt to find the promise in baseSearchInflight
-            // Check by query.baseSearchRefId (could be refId or searchId of a base query)
-            inflightPromise = this.baseSearchInflight.get(query.baseSearchRefId);
-
-            // If not found, and baseSearchRefId might be a searchId,
-            // try to find the original base query by its searchId and use its refId.
-            // (Assuming baseSearchInflight is primarily keyed by refId for base queries,
-            // but also by searchId if populated for the base query)
-            if (!inflightPromise) {
-              const baseQueryTarget = options.targets.find(
-                t => t.searchType === 'base' && t.searchId === query.baseSearchRefId
-              );
-              if (baseQueryTarget) {
-                // A base query's promise could be stored under its refId or its searchId
-                inflightPromise = this.baseSearchInflight.get(baseQueryTarget.refId) || (baseQueryTarget.searchId ? this.baseSearchInflight.get(baseQueryTarget.searchId) : undefined) ;
-              }
-            }
-
-            if (inflightPromise) {
-              try {
-                awaitedBaseSearch = await inflightPromise;
-                if (awaitedBaseSearch && !this.isCacheValid(awaitedBaseSearch)) {
-                  awaitedBaseSearch = null; // Stale data from resolved promise
-                }
-                if (awaitedBaseSearch) {
-                  break; // Successfully got valid data
-                }
-              } catch (error) {
-                awaitedBaseSearch = null; // Ensure null on error
-              }
-            }
-
-            // If no promise or await failed/stale, and not the last attempt, delay
-            if (!awaitedBaseSearch && attempt < maxRetries - 1) {
-              await delay(retryDelayMs);
-            }
-          }
-          baseSearch = awaitedBaseSearch; // Update baseSearch with the result of retry logic
-        }
-
-        if (baseSearch) {
-          const chainResult = await this.doChainRequest(query, options, baseSearch);
-          chainResults.push(this.createDataFrame(query, chainResult));
-        } else {
-          // Fallback: Execute as a regular search if no valid baseSearch could be obtained
-          const result = await this.doRequest(query, options);
-          chainResults.push(this.createDataFrame(query, result));
-        }
-      } else {
-        // No baseSearchRefId, execute as regular search
+    // Standard and base searches are independent and can run with bounded concurrency.
+    const standardResults = await mapWithConcurrency(
+      standardSearches,
+      MAX_QUERY_EXECUTION_CONCURRENCY,
+      async (query) => {
         const result = await this.doRequest(query, options);
-        chainResults.push(this.createDataFrame(query, result));
+        return this.createDataFrame(query, result);
       }
-    }
-    
+    );
+
+    const completedBaseSearchResults = await mapWithConcurrency(
+      baseSearches,
+      MAX_QUERY_EXECUTION_CONCURRENCY,
+      async (query) => this.resolveBaseSearch(query, options)
+    );
+
+    const baseResults = completedBaseSearchResults.map((completedResult, index) =>
+      this.createDataFrame(baseSearches[index], {
+        fields: completedResult.fields,
+        results: completedResult.results,
+        sid: completedResult.sid,
+      })
+    );
+
+    // Chain searches are also independent once base searches are available.
+    const chainResults = await mapWithConcurrency(
+      chainSearches,
+      MAX_QUERY_EXECUTION_CONCURRENCY,
+      async (query) => {
+        const chainResult = await this.executeChainSearch(query, options);
+        return this.createDataFrame(query, chainResult);
+      }
+    );
+
     const allResults = [...standardResults, ...baseResults, ...chainResults];
     return { data: allResults };
+  }
+
+  private resolveQuerySearchType(query: SplunkQuery): EffectiveSearchType {
+    return resolveSearchType(query.searchType, query.mode);
+  }
+
+  private async resolveBaseSearch(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>
+  ): Promise<BaseSearchResult> {
+    const cacheKey = generateCacheKey(query, options);
+    const primaryKey = query.refId;
+    const searchIdKey = query.searchId;
+
+    const cachedResult = this.findBaseSearchResult(cacheKey);
+    if (cachedResult) {
+      return cachedResult;
+    }
+
+    const inflightPromise =
+      this.baseSearchInflight.get(cacheKey) ||
+      this.baseSearchInflight.get(primaryKey) ||
+      (searchIdKey ? this.baseSearchInflight.get(searchIdKey) : undefined);
+
+    if (inflightPromise) {
+      return inflightPromise;
+    }
+
+    const executeAndCacheBaseSearch = async (): Promise<BaseSearchResult> => {
+      const result = await this.doRequest(query, options);
+      const baseResult: BaseSearchResult = {
+        sid: result.sid || '',
+        searchId: query.searchId || query.refId,
+        refId: query.refId,
+        fields: result.fields,
+        results: result.results,
+        timestamp: Date.now(),
+        cacheKey,
+      };
+
+      this.baseSearchCache.set(cacheKey, baseResult);
+      this.baseSearchCache.set(query.refId, baseResult);
+      if (query.searchId) {
+        this.baseSearchCache.set(query.searchId, baseResult);
+      }
+
+      return baseResult;
+    };
+
+    let newPromise = executeAndCacheBaseSearch();
+    newPromise = newPromise.finally(() => {
+      this.baseSearchInflight.delete(cacheKey);
+      this.baseSearchInflight.delete(primaryKey);
+      if (searchIdKey) {
+        this.baseSearchInflight.delete(searchIdKey);
+      }
+    });
+
+    this.baseSearchInflight.set(cacheKey, newPromise);
+    this.baseSearchInflight.set(primaryKey, newPromise);
+    if (searchIdKey) {
+      this.baseSearchInflight.set(searchIdKey, newPromise);
+    }
+
+    return newPromise;
+  }
+
+  private async waitForBaseSearchInflight(baseSearchRefId: string, targets: SplunkQuery[]): Promise<BaseSearchResult | null> {
+    for (let attempt = 0; attempt < CHAIN_BASE_SEARCH_RETRY_ATTEMPTS; attempt++) {
+      let inflightPromise = this.baseSearchInflight.get(baseSearchRefId);
+
+      if (!inflightPromise) {
+        const baseQueryTarget = targets.find(
+          target =>
+            this.resolveQuerySearchType(target) === 'base' &&
+            (target.searchId === baseSearchRefId || target.refId === baseSearchRefId)
+        );
+
+        if (baseQueryTarget) {
+          inflightPromise =
+            this.baseSearchInflight.get(baseQueryTarget.refId) ||
+            (baseQueryTarget.searchId ? this.baseSearchInflight.get(baseQueryTarget.searchId) : undefined);
+        }
+      }
+
+      if (inflightPromise) {
+        try {
+          const awaitedBaseSearch = await inflightPromise;
+          if (awaitedBaseSearch && this.isCacheValid(awaitedBaseSearch)) {
+            return awaitedBaseSearch;
+          }
+        } catch {
+          // Ignore here and continue retrying; a later attempt may discover a fresh inflight base search.
+        }
+      }
+
+      if (attempt < CHAIN_BASE_SEARCH_RETRY_ATTEMPTS - 1) {
+        await delay(CHAIN_BASE_SEARCH_RETRY_DELAY_MS);
+      }
+    }
+
+    return null;
+  }
+
+  private async resolveChainBaseSearch(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>
+  ): Promise<BaseSearchResult> {
+    const baseSearchRefId = query.baseSearchRefId?.trim();
+    const queryRefId = query.refId || 'unknown';
+
+    if (!baseSearchRefId) {
+      throw new Error(`Chain search "${queryRefId}" requires baseSearchRefId and cannot run as a standard query.`);
+    }
+
+    const cachedBaseSearch = this.findBaseSearchResultByRefId(baseSearchRefId);
+    if (cachedBaseSearch && this.isCacheValid(cachedBaseSearch)) {
+      return cachedBaseSearch;
+    }
+
+    const awaitedBaseSearch = await this.waitForBaseSearchInflight(baseSearchRefId, options.targets);
+    if (awaitedBaseSearch) {
+      return awaitedBaseSearch;
+    }
+
+    throw new Error(
+      `Chain search "${queryRefId}" could not resolve base search "${baseSearchRefId}". ` +
+      'No fallback to standalone search is applied by default to avoid semantic drift.'
+    );
+  }
+
+  private async executeChainSearch(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>
+  ): Promise<QueryRequestResults> {
+    const baseSearch = await this.resolveChainBaseSearch(query, options);
+    return this.doChainRequest(query, options, baseSearch);
   }
   
   private createDataFrame(query: SplunkQuery, response: QueryRequestResults) {
@@ -641,7 +727,10 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
         ? `| loadjob ${baseSearch.sid} ${vars}`
         : `| loadjob ${baseSearch.sid} | ${vars}`;
     } else {
-      throw new Error(`Chain search requires a base search SID (refId=${query.refId || 'unknown'}).`);
+      throw new Error(
+        `Chain search "${query.refId || 'unknown'}" could not execute because base search ` +
+          `"${query.baseSearchRefId || baseSearch.refId}" has no SID.`
+      );
     }
 
     const data = new URLSearchParams({
@@ -651,27 +740,34 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       latest_time: to.toString(),
     }).toString();
 
-    const response: any = await lastValueFrom(
-      (getBackendSrv().fetch<any>({
-        method: 'POST',
-        url: this.url + '/services/search/jobs',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        data: data,
-      }) as any)
-    );
-    const sid: string = (response.data as any)?.sid ?? '';
-    if (sid.length > 0) {
-      const isComplete = await this.waitForSearchCompletion(sid);
-      if (!isComplete) {
-        throw new SplunkSearchTimeoutError(sid, 'chain', SEARCH_POLL_TIMEOUT_MS);
+    try {
+      const response: any = await lastValueFrom(
+        (getBackendSrv().fetch<any>({
+          method: 'POST',
+          url: this.url + '/services/search/jobs',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          data: data,
+        }) as any)
+      );
+      const sid: string = (response.data as any)?.sid ?? '';
+      if (sid.length > 0) {
+        const isComplete = await this.waitForSearchCompletion(sid);
+        if (!isComplete) {
+          throw new SplunkSearchTimeoutError(sid, 'chain', SEARCH_POLL_TIMEOUT_MS);
+        }
+
+        const result = await this.doGetAllResultsRequest(sid);
+        return result;
       }
 
-      const result = await this.doGetAllResultsRequest(sid);
-      return result;
+      throw new Error(`Chain search "${query.refId || 'unknown'}" returned an empty SID.`);
+    } catch (error) {
+      const baseRef = query.baseSearchRefId || baseSearch.refId;
+      throw new Error(
+        `Chain search "${query.refId || 'unknown'}" failed against base search "${baseRef}": ${getErrorMessage(error)}`
+      );
     }
-
-    throw new Error(`Chain search failed to return a SID (refId=${query.refId || 'unknown'}).`);
   }
 }
