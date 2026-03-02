@@ -54,6 +54,14 @@ jobs:
         if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn install --frozen-lockfile
 
+      - name: Lint
+        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
+        run: yarn lint
+
+      - name: Typecheck
+        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
+        run: yarn typecheck
+
       - name: Build plugin
         if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn build
@@ -61,7 +69,6 @@ jobs:
       - name: Run tests
         if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn test
-        continue-on-error: true
 
       - name: Create Release with Commit Hash
         if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true'
