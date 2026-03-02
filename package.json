@@ -102,7 +102,6 @@
     "react-router-dom-v5-compat": "6.30.2",
     "rimraf/minimatch": "3.1.5",
     "rimraf/glob/minimatch": "3.1.5",
-    "serialize-javascript": "7.0.3",
     "test-exclude/minimatch": "3.1.5",
     "test-exclude/glob/minimatch": "3.1.5"
   },
