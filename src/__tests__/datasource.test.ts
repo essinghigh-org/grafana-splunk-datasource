@@ -455,4 +455,68 @@ describe('DataSource base-search state isolation', () => {
     expect(doRequestASpy).toHaveBeenCalledTimes(1);
     expect(doRequestBSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('does not reuse inflight base search when different base queries share the same searchId', async () => {
+    const datasource = createDataSource();
+
+    const doRequestSpy = jest.spyOn(datasource, 'doRequest').mockImplementation(
+      async (query, options) =>
+        await new Promise<any>((resolve) => {
+          const delayMs = query.refId === 'A' ? 40 : 10;
+
+          setTimeout(() => {
+            resolve({
+              fields: ['value'],
+              results: [
+                {
+                  value: `${query.refId}:${query.queryText}:${options.range.from.valueOf()}-${options.range.to.valueOf()}`,
+                },
+              ],
+              sid: `sid-${query.refId}-${options.range.from.valueOf()}-${options.range.to.valueOf()}`,
+            });
+          }, delayMs);
+        })
+    );
+
+    const firstRequest = createQueryRequest([
+      {
+        refId: 'A',
+        queryText: 'index=alpha',
+        searchType: 'base',
+        searchId: 'shared-search-id',
+      },
+    ]);
+
+    const secondRequest = createQueryRequest([
+      {
+        refId: 'B',
+        queryText: 'index=beta',
+        searchType: 'base',
+        searchId: 'shared-search-id',
+      },
+    ]);
+
+    secondRequest.range = {
+      from: { valueOf: () => 3000 },
+      to: { valueOf: () => 4000 },
+      raw: {
+        from: 'now-10m',
+        to: 'now-5m',
+      },
+    };
+
+    const [firstResponse, secondResponse] = await Promise.all([
+      datasource.query(firstRequest),
+      datasource.query(secondRequest),
+    ]);
+
+    expect(doRequestSpy).toHaveBeenCalledTimes(2);
+    expect(doRequestSpy.mock.calls.map(([queryArg]) => queryArg.refId).sort()).toEqual(['A', 'B']);
+
+    const firstValue = (firstResponse.data[0] as any).fields[0].values[0];
+    const secondValue = (secondResponse.data[0] as any).fields[0].values[0];
+
+    expect(firstValue).toBe('A:index=alpha:1000-2000');
+    expect(secondValue).toBe('B:index=beta:3000-4000');
+  });
 });

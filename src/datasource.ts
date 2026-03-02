@@ -266,7 +266,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const baseSearches = options.targets.filter(query => this.resolveQuerySearchType(query) === 'base');
     const chainSearches = options.targets.filter(query => this.resolveQuerySearchType(query) === 'chain');
 
-    // Standard and base searches are independent and can run with bounded concurrency.
+    // Standard searches run first with bounded concurrency.
     const standardResults = await mapWithConcurrency(
       standardSearches,
       MAX_QUERY_EXECUTION_CONCURRENCY,
@@ -276,6 +276,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       }
     );
 
+    // Base searches run afterward with the same bounded concurrency.
     const completedBaseSearchResults = await mapWithConcurrency(
       baseSearches,
       MAX_QUERY_EXECUTION_CONCURRENCY,
@@ -313,18 +314,13 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     options: DataQueryRequest<SplunkQuery>
   ): Promise<BaseSearchResult> {
     const cacheKey = generateCacheKey(query, options);
-    const primaryKey = query.refId;
-    const searchIdKey = query.searchId;
 
     const cachedResult = this.findBaseSearchResult(cacheKey);
     if (cachedResult) {
       return cachedResult;
     }
 
-    const inflightPromise =
-      this.baseSearchInflight.get(cacheKey) ||
-      this.baseSearchInflight.get(primaryKey) ||
-      (searchIdKey ? this.baseSearchInflight.get(searchIdKey) : undefined);
+    const inflightPromise = this.baseSearchInflight.get(cacheKey);
 
     if (inflightPromise) {
       return inflightPromise;
@@ -354,38 +350,27 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     let newPromise = executeAndCacheBaseSearch();
     newPromise = newPromise.finally(() => {
       this.baseSearchInflight.delete(cacheKey);
-      this.baseSearchInflight.delete(primaryKey);
-      if (searchIdKey) {
-        this.baseSearchInflight.delete(searchIdKey);
-      }
     });
 
     this.baseSearchInflight.set(cacheKey, newPromise);
-    this.baseSearchInflight.set(primaryKey, newPromise);
-    if (searchIdKey) {
-      this.baseSearchInflight.set(searchIdKey, newPromise);
-    }
 
     return newPromise;
   }
 
-  private async waitForBaseSearchInflight(baseSearchRefId: string, targets: SplunkQuery[]): Promise<BaseSearchResult | null> {
+  private async waitForBaseSearchInflight(
+    baseSearchRefId: string,
+    options: DataQueryRequest<SplunkQuery>
+  ): Promise<BaseSearchResult | null> {
     for (let attempt = 0; attempt < CHAIN_BASE_SEARCH_RETRY_ATTEMPTS; attempt++) {
-      let inflightPromise = this.baseSearchInflight.get(baseSearchRefId);
+      const baseQueryTarget = options.targets.find(
+        target =>
+          this.resolveQuerySearchType(target) === 'base' &&
+          (target.searchId === baseSearchRefId || target.refId === baseSearchRefId)
+      );
 
-      if (!inflightPromise) {
-        const baseQueryTarget = targets.find(
-          target =>
-            this.resolveQuerySearchType(target) === 'base' &&
-            (target.searchId === baseSearchRefId || target.refId === baseSearchRefId)
-        );
-
-        if (baseQueryTarget) {
-          inflightPromise =
-            this.baseSearchInflight.get(baseQueryTarget.refId) ||
-            (baseQueryTarget.searchId ? this.baseSearchInflight.get(baseQueryTarget.searchId) : undefined);
-        }
-      }
+      const inflightPromise = baseQueryTarget
+        ? this.baseSearchInflight.get(generateCacheKey(baseQueryTarget, options))
+        : undefined;
 
       if (inflightPromise) {
         try {
@@ -422,7 +407,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       return cachedBaseSearch;
     }
 
-    const awaitedBaseSearch = await this.waitForBaseSearchInflight(baseSearchRefId, options.targets);
+    const awaitedBaseSearch = await this.waitForBaseSearchInflight(baseSearchRefId, options);
     if (awaitedBaseSearch) {
       return awaitedBaseSearch;
     }
