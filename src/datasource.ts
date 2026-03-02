@@ -1,7 +1,8 @@
 import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
-import { lastValueFrom } from 'rxjs';
+import { from, lastValueFrom } from 'rxjs';
 
 import {
+  CustomVariableSupport,
   DataQueryRequest,
   DataQueryResponse,
   DataSourceApi,
@@ -9,13 +10,41 @@ import {
   MetricFindValue,
   PartialDataFrame,
   FieldType,
+  dateTime,
 } from '@grafana/data';
 
 import { SplunkQuery, SplunkDataSourceOptions, defaultQueryRequestResults, QueryRequestResults, BaseSearchResult } from './types';
+import { SplunkVariableQuery, VariableQueryEditor } from './VariableQueryEditor';
 
 const baseSearchCache: Map<string, BaseSearchResult> = new Map();
 const baseSearchInflight: Map<string, Promise<BaseSearchResult>> = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
+const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
+
+type VariableQueryInput = SplunkQuery | SplunkVariableQuery | string | Record<string, unknown>;
+
+class SplunkCustomVariableSupport extends CustomVariableSupport<
+  DataSource,
+  SplunkVariableQuery,
+  SplunkQuery,
+  SplunkDataSourceOptions
+> {
+  editor = VariableQueryEditor;
+
+  constructor(private readonly datasource: DataSource) {
+    super();
+  }
+
+  query(request: DataQueryRequest<SplunkVariableQuery>) {
+    const variableQuery = request.targets?.[0] ?? '';
+
+    return from(
+      this.datasource
+        .metricFindQuery(variableQuery, request as unknown as DataQueryRequest<SplunkQuery>)
+        .then((metricFindValues) => ({ data: metricFindValues }))
+    );
+  }
+}
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -40,24 +69,108 @@ function generateCacheKey(query: SplunkQuery, options: DataQueryRequest<SplunkQu
 
 export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptions> {
   url?: string;
+  variables = new SplunkCustomVariableSupport(this);
 
   constructor(instanceSettings: DataSourceInstanceSettings<SplunkDataSourceOptions>) {
     super(instanceSettings);
 
     this.url = instanceSettings.url;
   }
-  async metricFindQuery(query: SplunkQuery, options: DataQueryRequest<SplunkQuery>): Promise<MetricFindValue[]> {
-    const promises: MetricFindValue[] = await this.doRequest(query, options).then((response: QueryRequestResults) => {
-      const frame: MetricFindValue[] = [];
-      response.results.forEach((result: any) => {
-        response.fields.forEach((field: string) => {
-          const f: MetricFindValue = { text: result[field] };
-          frame.push(f);
-        });
+
+  async metricFindQuery(query: VariableQueryInput, options?: DataQueryRequest<SplunkQuery>): Promise<MetricFindValue[]> {
+    const normalizedQuery = this.normalizeMetricFindQuery(query);
+    if (!normalizedQuery) {
+      return [];
+    }
+
+    const safeOptions = this.createMetricFindOptions(normalizedQuery, options);
+    const response = await this.doRequest(normalizedQuery, safeOptions);
+
+    const frame: MetricFindValue[] = [];
+    response.results.forEach((result: Record<string, unknown>) => {
+      response.fields.forEach((field: string) => {
+        const value = result[field];
+        if (value === undefined || value === null || value === '') {
+          return;
+        }
+
+        frame.push({ text: String(value) });
       });
-      return frame;
     });
-    return Promise.all(promises);
+
+    return frame;
+  }
+
+  private normalizeMetricFindQuery(rawQuery: VariableQueryInput): SplunkQuery | null {
+    if (typeof rawQuery === 'string') {
+      const queryText = rawQuery.trim();
+      if (!queryText) {
+        return null;
+      }
+
+      return {
+        refId: 'metricFindQuery',
+        queryText,
+        searchType: 'standard',
+      };
+    }
+
+    if (!rawQuery || typeof rawQuery !== 'object') {
+      return null;
+    }
+
+    const queryRecord = rawQuery as Record<string, unknown>;
+    const queryTextSource =
+      typeof queryRecord.queryText === 'string'
+        ? queryRecord.queryText
+        : typeof queryRecord.query === 'string'
+          ? queryRecord.query
+          : '';
+    const queryText = queryTextSource.trim();
+
+    if (!queryText) {
+      return null;
+    }
+
+    const searchType =
+      queryRecord.searchType === 'base' || queryRecord.searchType === 'chain' || queryRecord.searchType === 'standard'
+        ? queryRecord.searchType
+        : 'standard';
+    const mode = queryRecord.mode === 'base' || queryRecord.mode === 'chain' ? queryRecord.mode : undefined;
+
+    return {
+      ...(queryRecord as Partial<SplunkQuery>),
+      refId: typeof queryRecord.refId === 'string' && queryRecord.refId.length > 0 ? queryRecord.refId : 'metricFindQuery',
+      queryText,
+      searchType,
+      mode,
+      baseSearchRefId: typeof queryRecord.baseSearchRefId === 'string' ? queryRecord.baseSearchRefId : undefined,
+      searchId: typeof queryRecord.searchId === 'string' ? queryRecord.searchId : undefined,
+    };
+  }
+
+  private createMetricFindOptions(
+    query: SplunkQuery,
+    options?: DataQueryRequest<SplunkQuery>
+  ): DataQueryRequest<SplunkQuery> {
+    const now = Date.now();
+    const fallbackRange: DataQueryRequest<SplunkQuery>['range'] = {
+      from: dateTime(now - DEFAULT_VARIABLE_QUERY_RANGE_MS),
+      to: dateTime(now),
+      raw: {
+        from: 'now-1h',
+        to: 'now',
+      },
+    };
+    const hasRange = Boolean(options?.range?.from && options?.range?.to);
+    const safeOptions: Partial<DataQueryRequest<SplunkQuery>> = {
+      ...(options ?? {}),
+      scopedVars: options?.scopedVars ?? {},
+      targets: options?.targets?.length ? options.targets : [query],
+      range: hasRange ? options?.range : fallbackRange,
+    };
+
+    return safeOptions as DataQueryRequest<SplunkQuery>;
   }
 
   async query(options: DataQueryRequest<SplunkQuery>): Promise<DataQueryResponse> {
