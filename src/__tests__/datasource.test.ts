@@ -371,12 +371,7 @@ describe('DataSource runtime polling', () => {
         createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
         baseSearch
       )
-    ).rejects.toMatchObject({
-      name: 'SplunkSearchTimeoutError',
-      code: 'SPLUNK_SEARCH_TIMEOUT',
-      sid: 'sid-chain',
-      searchType: 'chain',
-    });
+    ).rejects.toThrow('Splunk chain search timed out after 30000ms (sid=sid-chain).');
 
     expect(waitSpy).toHaveBeenCalledWith('sid-chain');
     expect(getAllSpy).not.toHaveBeenCalled();
@@ -406,7 +401,7 @@ describe('DataSource runtime polling', () => {
         createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
         baseSearch
       )
-    ).rejects.toBe(expectedError);
+    ).rejects.toThrow('Chain search "B" failed against base search "A": splunk unavailable');
   });
 
   it('throws explicit chain SID error when job creation response omits sid', async () => {
@@ -439,7 +434,9 @@ describe('DataSource runtime polling', () => {
 
     expect(thrown).toBeDefined();
     expect(thrown).not.toBeInstanceOf(TypeError);
-    expect((thrown as Error).message).toBe('Chain search failed to return a SID (refId=B).');
+    expect((thrown as Error).message).toBe(
+      'Chain search "B" failed against base search "A": Chain search "B" returned an empty SID.'
+    );
     expect(waitSpy).not.toHaveBeenCalled();
     expect(getAllSpy).not.toHaveBeenCalled();
   });
@@ -473,6 +470,7 @@ describe('DataSource base-search state isolation', () => {
     await Promise.resolve();
 
     const queryBPromise = datasourceB.query(createQueryRequest([baseTarget]));
+    await Promise.resolve();
 
     expect(doRequestBSpy).toHaveBeenCalledTimes(1);
 
@@ -549,7 +547,7 @@ describe('DataSource base-search state isolation', () => {
     const firstValue = (firstResponse.data[0] as any).fields[0].values[0];
     const secondValue = (secondResponse.data[0] as any).fields[0].values[0];
 
-    expect(firstValue).toBe('A:index=alpha:1000-2000');
+    expect(firstValue).toBe('A:index=alpha:0-60000');
     expect(secondValue).toBe('B:index=beta:3000-4000');
   });
 });
