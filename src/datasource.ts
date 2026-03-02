@@ -175,6 +175,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const response = await this.doRequest(normalizedQuery, safeOptions);
 
     const frame: MetricFindValue[] = [];
+    const seenTexts = new Set<string>();
     response.results.forEach((result: Record<string, unknown>) => {
       response.fields.forEach((field: string) => {
         const value = result[field];
@@ -182,7 +183,13 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           return;
         }
 
-        frame.push({ text: String(value) });
+        const text = String(value);
+        if (seenTexts.has(text)) {
+          return;
+        }
+
+        seenTexts.add(text);
+        frame.push({ text });
       });
     });
 
@@ -427,8 +434,6 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
   }
   
   private createDataFrame(query: SplunkQuery, response: QueryRequestResults) {
-    const moment = require('moment');
-    
     // Prepare fields with proper typing
     const fields = response.fields.map((fieldName: any) => {
       const values: any[] = [];
@@ -437,8 +442,8 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       // First pass: collect values
       response.results.forEach((result: any) => {
         if (fieldName === '_time') {
-          const time = moment(result['_time']).format('YYYY-MM-DDTHH:mm:ssZ');
-          values.push(time);
+          const parsedTime = dateTime(result['_time']).valueOf();
+          values.push(Number.isFinite(parsedTime) ? parsedTime : null);
         } else {
           values.push(result[fieldName]);
         }

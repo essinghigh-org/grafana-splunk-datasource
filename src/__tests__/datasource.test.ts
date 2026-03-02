@@ -28,8 +28,8 @@ jest.mock('@grafana/data', () => {
       time: 'time',
       number: 'number',
     },
-    dateTime: (value: number) => ({
-      valueOf: () => value,
+    dateTime: (value: number | string | null | undefined) => ({
+      valueOf: () => (typeof value === 'number' ? value : Date.parse(String(value))),
     }),
   };
 });
@@ -155,6 +155,23 @@ describe('DataSource.metricFindQuery', () => {
     expect(result).toEqual([{ text: '0' }, { text: 'false' }, { text: 'api-1' }]);
   });
 
+  it('deduplicates metricFindQuery values while preserving first-seen order', async () => {
+    const datasource = createDataSource();
+    jest.spyOn(datasource, 'doRequest').mockResolvedValue({
+      fields: ['host', 'source'],
+      results: [
+        { host: 'api-1', source: 'src-a' },
+        { host: 'api-1', source: 'src-b' },
+        { host: 'api-2', source: 'src-a' },
+        { host: 'api-1', source: 'src-b' },
+      ],
+    } as QueryRequestResults);
+
+    const result = await datasource.metricFindQuery('index=_internal | fields host, source');
+
+    expect(result).toEqual([{ text: 'api-1' }, { text: 'src-a' }, { text: 'src-b' }, { text: 'api-2' }]);
+  });
+
   it('supports legacy variable-query input that uses query', async () => {
     const datasource = createDataSource();
     const doRequestSpy = jest.spyOn(datasource, 'doRequest').mockResolvedValue({
@@ -216,6 +233,7 @@ describe('DataSource.metricFindQuery', () => {
   });
 });
 
+<<<<<<< HEAD
 describe('DataSource runtime pagination', () => {
   beforeEach(() => {
     mockedGetBackendSrv.mockReset();
@@ -518,5 +536,40 @@ describe('DataSource base-search state isolation', () => {
 
     expect(firstValue).toBe('A:index=alpha:1000-2000');
     expect(secondValue).toBe('B:index=beta:3000-4000');
+  });
+});
+
+describe('DataSource.createDataFrame', () => {
+  it('parses _time with Grafana dateTime and preserves null for invalid timestamps', () => {
+    const datasource = createDataSource();
+
+    const frame = (datasource as any).createDataFrame(
+      {
+        refId: 'A',
+        queryText: 'search index=_internal',
+      },
+      {
+        fields: ['_time', 'count'],
+        results: [
+          { _time: '2024-01-01T00:00:00Z', count: '2' },
+          { _time: 'invalid-time', count: '3' },
+        ],
+      }
+    );
+
+    expect(frame.fields[0]).toEqual(
+      expect.objectContaining({
+        name: '_time',
+        type: 'time',
+      })
+    );
+    expect(frame.fields[0].values).toEqual([Date.parse('2024-01-01T00:00:00Z'), null]);
+    expect(frame.fields[1]).toEqual(
+      expect.objectContaining({
+        name: 'count',
+        type: 'number',
+        values: [2, 3],
+      })
+    );
   });
 });
