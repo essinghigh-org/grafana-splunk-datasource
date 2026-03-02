@@ -1,3 +1,10 @@
+## b059b15 (2026-03-02)
+
+chore(deps-dev): bump webpack from 5.99.9 to 5.104.1 (#16)
+
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+
+
 ## 85d3667 (2025-06-09)
 
 fix query styling (#15)
