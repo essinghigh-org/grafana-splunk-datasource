@@ -20,6 +20,20 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
 const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
 const SEARCH_POLL_INTERVAL_MS = 100;
 const SEARCH_POLL_TIMEOUT_MS = 30 * 1000;
+const SEARCH_TIMEOUT_ERROR_CODE = 'SPLUNK_SEARCH_TIMEOUT';
+
+class SplunkSearchTimeoutError extends Error {
+  readonly code = SEARCH_TIMEOUT_ERROR_CODE;
+
+  constructor(
+    readonly sid: string,
+    readonly searchType: 'standard' | 'chain',
+    readonly timeoutMs: number
+  ) {
+    super(`Splunk ${searchType} search timed out after ${timeoutMs}ms (sid=${sid}).`);
+    this.name = 'SplunkSearchTimeoutError';
+  }
+}
 
 type VariableQueryInput = SplunkQuery | SplunkVariableQuery | string | Record<string, unknown>;
 
@@ -573,7 +587,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       const responseData = response.data as any;
       const pageResults: any[] = responseData.results || [];
 
-      if ((responseData.post_process_count === 0 && pageResults.length === 0) || pageResults.length === 0) {
+      if (pageResults.length === 0) {
         isFinished = true;
       } else {
         if (isFirst) {
@@ -602,7 +616,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     if (sid.length > 0) {
       const isComplete = await this.waitForSearchCompletion(sid);
       if (!isComplete) {
-        return { ...defaultQueryRequestResults, sid };
+        throw new SplunkSearchTimeoutError(sid, 'standard', SEARCH_POLL_TIMEOUT_MS);
       }
 
       const result = await this.doGetAllResultsRequest(sid);
@@ -627,7 +641,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
         ? `| loadjob ${baseSearch.sid} ${vars}`
         : `| loadjob ${baseSearch.sid} | ${vars}`;
     } else {
-      return this.executeChainOnCachedResults(query, baseSearch);
+      throw new Error(`Chain search requires a base search SID (refId=${query.refId || 'unknown'}).`);
     }
 
     const data = new URLSearchParams({
@@ -637,45 +651,27 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       latest_time: to.toString(),
     }).toString();
 
-    try {
-      const response: any = await lastValueFrom(
-        (getBackendSrv().fetch<any>({
-          method: 'POST',
-          url: this.url + '/services/search/jobs',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          data: data,
-        }) as any)
-      );
-      const sid: string = (response.data as any).sid;
-      if (sid.length > 0) {
-        const isComplete = await this.waitForSearchCompletion(sid);
-        if (!isComplete) {
-          return this.executeChainOnCachedResults(query, baseSearch);
-        }
-
-        const result = await this.doGetAllResultsRequest(sid);
-        return result;
+    const response: any = await lastValueFrom(
+      (getBackendSrv().fetch<any>({
+        method: 'POST',
+        url: this.url + '/services/search/jobs',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        data: data,
+      }) as any)
+    );
+    const sid: string = (response.data as any).sid;
+    if (sid.length > 0) {
+      const isComplete = await this.waitForSearchCompletion(sid);
+      if (!isComplete) {
+        throw new SplunkSearchTimeoutError(sid, 'chain', SEARCH_POLL_TIMEOUT_MS);
       }
-    } catch (error) {
-      return this.executeChainOnCachedResults(query, baseSearch);
+
+      const result = await this.doGetAllResultsRequest(sid);
+      return result;
     }
-    
-    return defaultQueryRequestResults;
-  }
-  
-  private async executeChainOnCachedResults(query: SplunkQuery, baseSearch: BaseSearchResult): Promise<QueryRequestResults> {
-    // This is a simplified implementation that works with cached results
-    // In a full implementation, you might want to use Splunk's SDK or execute
-    // the transformations locally
-    
-    // For now, we'll return the base search results and let Grafana handle transformations
-    // This could be enhanced to parse and execute simple Splunk commands locally
-    
-    return {
-      fields: baseSearch.fields,
-      results: baseSearch.results
-    };
+
+    throw new Error(`Chain search failed to return a SID (refId=${query.refId || 'unknown'}).`);
   }
 }

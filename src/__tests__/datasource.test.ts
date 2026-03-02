@@ -299,23 +299,23 @@ describe('DataSource runtime polling', () => {
     const waitSpy = jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue(false);
     const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
 
-    const result = await datasource.doRequest(
-      { refId: 'A', queryText: 'index=_internal', searchType: 'standard' } as any,
-      createQueryRequest([{ refId: 'A' }])
-    );
+    await expect(
+      datasource.doRequest(
+        { refId: 'A', queryText: 'index=_internal', searchType: 'standard' } as any,
+        createQueryRequest([{ refId: 'A' }])
+      )
+    ).rejects.toMatchObject({
+      name: 'SplunkSearchTimeoutError',
+      code: 'SPLUNK_SEARCH_TIMEOUT',
+      sid: 'sid-standard',
+      searchType: 'standard',
+    });
 
     expect(waitSpy).toHaveBeenCalledWith('sid-standard');
     expect(getAllSpy).not.toHaveBeenCalled();
-    expect(result).toEqual(
-      expect.objectContaining({
-        sid: 'sid-standard',
-        fields: [],
-        results: [],
-      })
-    );
   });
 
-  it('uses bounded polling helper in chain flow and falls back to cached results on timeout', async () => {
+  it('uses bounded polling helper in chain flow and surfaces timeout failures', async () => {
     const datasource = createDataSource();
     const fetchMock = jest.fn().mockReturnValue(of({ data: { sid: 'sid-chain' } }));
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
@@ -332,18 +332,48 @@ describe('DataSource runtime polling', () => {
       cacheKey: 'base-cache-key',
     };
 
-    const result = await datasource.doChainRequest(
-      { refId: 'B', queryText: '| stats count by host', searchType: 'chain' } as any,
-      createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
-      baseSearch
-    );
+    await expect(
+      datasource.doChainRequest(
+        { refId: 'B', queryText: '| stats count by host', searchType: 'chain' } as any,
+        createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
+        baseSearch
+      )
+    ).rejects.toMatchObject({
+      name: 'SplunkSearchTimeoutError',
+      code: 'SPLUNK_SEARCH_TIMEOUT',
+      sid: 'sid-chain',
+      searchType: 'chain',
+    });
 
     expect(waitSpy).toHaveBeenCalledWith('sid-chain');
     expect(getAllSpy).not.toHaveBeenCalled();
-    expect(result).toEqual({
+  });
+
+  it('surfaces chain execution failures instead of returning cached base results', async () => {
+    const datasource = createDataSource();
+    const expectedError = new Error('splunk unavailable');
+    const fetchMock = jest.fn().mockImplementation(() => {
+      throw expectedError;
+    });
+    mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
+
+    const baseSearch = {
+      sid: 'sid-base',
+      searchId: 'base-search',
+      refId: 'A',
       fields: ['host'],
       results: [{ host: 'api-1' }],
-    });
+      timestamp: Date.now(),
+      cacheKey: 'base-cache-key',
+    };
+
+    await expect(
+      datasource.doChainRequest(
+        { refId: 'B', queryText: '| stats count by host', searchType: 'chain' } as any,
+        createQueryRequest([{ refId: 'B', queryText: '| stats count by host', searchType: 'chain' }]),
+        baseSearch
+      )
+    ).rejects.toBe(expectedError);
   });
 });
 
