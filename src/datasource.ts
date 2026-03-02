@@ -16,10 +16,10 @@ import {
 import { SplunkQuery, SplunkDataSourceOptions, defaultQueryRequestResults, QueryRequestResults, BaseSearchResult } from './types';
 import { SplunkVariableQuery, VariableQueryEditor } from './VariableQueryEditor';
 
-const baseSearchCache: Map<string, BaseSearchResult> = new Map();
-const baseSearchInflight: Map<string, Promise<BaseSearchResult>> = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
 const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
+const SEARCH_POLL_INTERVAL_MS = 100;
+const SEARCH_POLL_TIMEOUT_MS = 30 * 1000;
 
 type VariableQueryInput = SplunkQuery | SplunkVariableQuery | string | Record<string, unknown>;
 
@@ -70,6 +70,8 @@ function generateCacheKey(query: SplunkQuery, options: DataQueryRequest<SplunkQu
 export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptions> {
   url?: string;
   variables = new SplunkCustomVariableSupport(this);
+  private readonly baseSearchCache: Map<string, BaseSearchResult> = new Map();
+  private readonly baseSearchInflight: Map<string, Promise<BaseSearchResult>> = new Map();
 
   constructor(instanceSettings: DataSourceInstanceSettings<SplunkDataSourceOptions>) {
     super(instanceSettings);
@@ -203,7 +205,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
         baseSearchPromises.push(Promise.resolve(cachedResult));
       } else {
         // 2. Check for existing in-flight promise
-        let inflightPromise = baseSearchInflight.get(cacheKey);
+        let inflightPromise = this.baseSearchInflight.get(cacheKey);
 
         if (inflightPromise) {
           baseSearchPromises.push(inflightPromise);
@@ -222,11 +224,11 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
             };
             
             // Store in cache with the proper cache key
-            baseSearchCache.set(cacheKey, baseResult);
+            this.baseSearchCache.set(cacheKey, baseResult);
             // Also store with refId and searchId for chain search compatibility
-            baseSearchCache.set(query.refId, baseResult);
+            this.baseSearchCache.set(query.refId, baseResult);
             if (query.searchId) {
-              baseSearchCache.set(query.searchId, baseResult);
+              this.baseSearchCache.set(query.searchId, baseResult);
             }
             return baseResult;
           };
@@ -235,17 +237,17 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
 
           // Wrap promise with finally for cleanup
           newPromise = newPromise.finally(() => {
-            baseSearchInflight.delete(cacheKey);
-            baseSearchInflight.delete(primaryKey);
+            this.baseSearchInflight.delete(cacheKey);
+            this.baseSearchInflight.delete(primaryKey);
             if (searchIdKey) {
-              baseSearchInflight.delete(searchIdKey);
+              this.baseSearchInflight.delete(searchIdKey);
             }
           });
 
-          baseSearchInflight.set(cacheKey, newPromise);
-          baseSearchInflight.set(primaryKey, newPromise);
+          this.baseSearchInflight.set(cacheKey, newPromise);
+          this.baseSearchInflight.set(primaryKey, newPromise);
           if (searchIdKey) {
-            baseSearchInflight.set(searchIdKey, newPromise);
+            this.baseSearchInflight.set(searchIdKey, newPromise);
           }
           baseSearchPromises.push(newPromise);
         }
@@ -282,7 +284,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           for (let attempt = 0; attempt < maxRetries; attempt++) {
             // Attempt to find the promise in baseSearchInflight
             // Check by query.baseSearchRefId (could be refId or searchId of a base query)
-            inflightPromise = baseSearchInflight.get(query.baseSearchRefId);
+            inflightPromise = this.baseSearchInflight.get(query.baseSearchRefId);
 
             // If not found, and baseSearchRefId might be a searchId,
             // try to find the original base query by its searchId and use its refId.
@@ -294,7 +296,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
               );
               if (baseQueryTarget) {
                 // A base query's promise could be stored under its refId or its searchId
-                inflightPromise = baseSearchInflight.get(baseQueryTarget.refId) || (baseQueryTarget.searchId ? baseSearchInflight.get(baseQueryTarget.searchId) : undefined) ;
+                inflightPromise = this.baseSearchInflight.get(baseQueryTarget.refId) || (baseQueryTarget.searchId ? this.baseSearchInflight.get(baseQueryTarget.searchId) : undefined) ;
               }
             }
 
@@ -409,23 +411,23 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
   }
   
   private findBaseSearchResult(cacheKey: string): BaseSearchResult | null {
-    const cachedResult = baseSearchCache.get(cacheKey);
+    const cachedResult = this.baseSearchCache.get(cacheKey);
     if (cachedResult && this.isCacheValid(cachedResult)) {
       return cachedResult;
     } else if (cachedResult && !this.isCacheValid(cachedResult)) {
       // Remove stale cache entry
-      baseSearchCache.delete(cacheKey);
+      this.baseSearchCache.delete(cacheKey);
     }
     return null;
   }
   
   private findBaseSearchResultByRefId(baseSearchRefId: string): BaseSearchResult | null {
-    const cachedResult = baseSearchCache.get(baseSearchRefId);
+    const cachedResult = this.baseSearchCache.get(baseSearchRefId);
     if (cachedResult && this.isCacheValid(cachedResult)) {
       return cachedResult;
     } else if (cachedResult && !this.isCacheValid(cachedResult)) {
       // Remove stale cache entry
-      baseSearchCache.delete(baseSearchRefId);
+      this.baseSearchCache.delete(baseSearchRefId);
     }
     return null;
   }
@@ -438,15 +440,38 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const now = Date.now();
     const keysToDelete: string[] = [];
     
-    for (const [key, result] of baseSearchCache.entries()) {
+    for (const [key, result] of this.baseSearchCache.entries()) {
       if ((now - result.timestamp) >= CACHE_TTL) {
         keysToDelete.push(key);
       }
     }
     
     keysToDelete.forEach(key => {
-      baseSearchCache.delete(key);
+      this.baseSearchCache.delete(key);
     });
+  }
+
+  private async waitForSearchCompletion(
+    sid: string,
+    pollIntervalMs: number = SEARCH_POLL_INTERVAL_MS,
+    timeoutMs: number = SEARCH_POLL_TIMEOUT_MS
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (await this.doSearchStatusRequest(sid)) {
+        return true;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+
+      await delay(Math.min(pollIntervalMs, remainingMs));
+    }
+
+    return this.doSearchStatusRequest(sid);
   }
 
   async testDatasource() {
@@ -544,18 +569,20 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           },
         }) as any)
       );
-      if ((response.data as any).post_process_count === 0 && (response.data as any).results.length === 0) {
+
+      const responseData = response.data as any;
+      const pageResults: any[] = responseData.results || [];
+
+      if ((responseData.post_process_count === 0 && pageResults.length === 0) || pageResults.length === 0) {
         isFinished = true;
       } else {
         if (isFirst) {
           isFirst = false;
-          fields = (response.data as any).fields.map((field: any) => field['name']);
+          fields = (responseData.fields || []).map((field: any) => field['name']);
         }
-        offset = offset + count;
-        results = results.concat((response.data as any).results);
+        results = results.concat(pageResults);
+        offset = offset + pageResults.length;
       }
-
-      offset = offset + count;
     }
 
     const index = fields.indexOf('_raw', 0);
@@ -573,9 +600,11 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const searchResult = await this.doSearchRequest(query, options);
     const sid: string = searchResult?.sid || '';
     if (sid.length > 0) {
-      while (!(await this.doSearchStatusRequest(sid))) {
-        await delay(100);
+      const isComplete = await this.waitForSearchCompletion(sid);
+      if (!isComplete) {
+        return { ...defaultQueryRequestResults, sid };
       }
+
       const result = await this.doGetAllResultsRequest(sid);
       return { ...result, sid };
     }
@@ -621,7 +650,11 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       );
       const sid: string = (response.data as any).sid;
       if (sid.length > 0) {
-        while (!(await this.doSearchStatusRequest(sid))) {}
+        const isComplete = await this.waitForSearchCompletion(sid);
+        if (!isComplete) {
+          return this.executeChainOnCachedResults(query, baseSearch);
+        }
+
         const result = await this.doGetAllResultsRequest(sid);
         return result;
       }
