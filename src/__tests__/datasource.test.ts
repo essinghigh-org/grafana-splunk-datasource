@@ -29,7 +29,23 @@ jest.mock('@grafana/data', () => {
       number: 'number',
     },
     dateTime: (value: number | string | null | undefined) => ({
-      valueOf: () => (typeof value === 'number' ? value : Date.parse(String(value))),
+      valueOf: () => {
+        const fixedNow = Date.parse('2026-03-02T00:00:00Z');
+
+        if (typeof value === 'number') {
+          return value;
+        }
+
+        if (value === null || value === undefined) {
+          return fixedNow;
+        }
+
+        if (typeof value === 'string' && value.trim() === '') {
+          return fixedNow;
+        }
+
+        return Date.parse(String(value));
+      },
     }),
   };
 });
@@ -233,7 +249,6 @@ describe('DataSource.metricFindQuery', () => {
   });
 });
 
-<<<<<<< HEAD
 describe('DataSource runtime pagination', () => {
   beforeEach(() => {
     mockedGetBackendSrv.mockReset();
@@ -540,7 +555,7 @@ describe('DataSource base-search state isolation', () => {
 });
 
 describe('DataSource.createDataFrame', () => {
-  it('parses _time with Grafana dateTime and preserves null for invalid timestamps', () => {
+  it('maps missing/undefined/null/empty _time values to null and keeps invalid timestamps null', () => {
     const datasource = createDataSource();
 
     const frame = (datasource as any).createDataFrame(
@@ -552,7 +567,12 @@ describe('DataSource.createDataFrame', () => {
         fields: ['_time', 'count'],
         results: [
           { _time: '2024-01-01T00:00:00Z', count: '2' },
-          { _time: 'invalid-time', count: '3' },
+          { _time: undefined, count: '3' },
+          { _time: null, count: '4' },
+          { _time: '', count: '5' },
+          { _time: '   ', count: '6' },
+          { count: '7' },
+          { _time: 'invalid-time', count: '8' },
         ],
       }
     );
@@ -563,12 +583,20 @@ describe('DataSource.createDataFrame', () => {
         type: 'time',
       })
     );
-    expect(frame.fields[0].values).toEqual([Date.parse('2024-01-01T00:00:00Z'), null]);
+    expect(frame.fields[0].values).toEqual([
+      Date.parse('2024-01-01T00:00:00Z'),
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+    ]);
     expect(frame.fields[1]).toEqual(
       expect.objectContaining({
         name: 'count',
         type: 'number',
-        values: [2, 3],
+        values: [2, 3, 4, 5, 6, 7, 8],
       })
     );
   });

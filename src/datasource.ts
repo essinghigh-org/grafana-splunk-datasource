@@ -442,8 +442,13 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       // First pass: collect values
       response.results.forEach((result: any) => {
         if (fieldName === '_time') {
-          const parsedTime = dateTime(result['_time']).valueOf();
-          values.push(Number.isFinite(parsedTime) ? parsedTime : null);
+          const rawTime = result['_time'];
+          if (rawTime === null || rawTime === undefined || (typeof rawTime === 'string' && rawTime.trim() === '')) {
+            values.push(null);
+          } else {
+            const parsedTime = dateTime(rawTime).valueOf();
+            values.push(Number.isFinite(parsedTime) ? parsedTime : null);
+          }
         } else {
           values.push(result[fieldName]);
         }
