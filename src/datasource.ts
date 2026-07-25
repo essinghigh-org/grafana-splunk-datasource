@@ -13,28 +13,58 @@ import {
   dateTime,
 } from '@grafana/data';
 
-import { SplunkQuery, SplunkDataSourceOptions, defaultQueryRequestResults, QueryRequestResults, BaseSearchResult } from './types';
+import {
+  SplunkQuery,
+  SplunkDataSourceOptions,
+  defaultQueryRequestResults,
+  QueryRequestResults,
+  BaseSearchResult,
+  BaseSearchMetadata,
+} from './types';
 import { SplunkVariableQuery, VariableQueryEditor } from './VariableQueryEditor';
 
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
 const DEFAULT_VARIABLE_QUERY_RANGE_MS = 60 * 60 * 1000;
 const MAX_QUERY_EXECUTION_CONCURRENCY = 4;
 const CHAIN_BASE_SEARCH_RETRY_ATTEMPTS = 3;
 const CHAIN_BASE_SEARCH_RETRY_DELAY_MS = 100;
 const SEARCH_POLL_INTERVAL_MS = 100;
-const SEARCH_POLL_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_STANDARD_SEARCH_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_MAX_RESULT_ROWS = 100_000;
+const DEFAULT_MAX_RESULT_PAGES = 100;
+const DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
 const SEARCH_TIMEOUT_ERROR_CODE = 'SPLUNK_SEARCH_TIMEOUT';
+const TERMINAL_SEARCH_STATES = new Set(['DONE', 'PAUSED', 'FAILED']);
+
+interface SearchStatus {
+  state: string;
+  messages: string[];
+}
+
+interface ResolvedBaseSearch {
+  result: BaseSearchResult;
+  cache: BaseSearchMetadata['cache'];
+}
 
 class SplunkSearchTimeoutError extends Error {
   readonly code = SEARCH_TIMEOUT_ERROR_CODE;
 
   constructor(
     readonly sid: string,
-    readonly searchType: 'standard' | 'chain',
+    readonly searchType: 'standard' | 'base' | 'chain',
     readonly timeoutMs: number
   ) {
     super(`Splunk ${searchType} search timed out after ${timeoutMs}ms (sid=${sid}).`);
     this.name = 'SplunkSearchTimeoutError';
+  }
+}
+
+class SplunkSearchFailedError extends Error {
+  constructor(
+    readonly sid: string,
+    messages: string[]
+  ) {
+    super(`Splunk search failed (sid=${sid})${messages.length ? `: ${messages.join('; ')}` : '.'}`);
+    this.name = 'SplunkSearchFailedError';
   }
 }
 
@@ -44,7 +74,8 @@ type EffectiveSearchType = NonNullable<SplunkQuery['searchType']>;
 const isSearchType = (value: unknown): value is EffectiveSearchType =>
   value === 'standard' || value === 'base' || value === 'chain';
 
-const isLegacyMode = (value: unknown): value is NonNullable<SplunkQuery['mode']> => value === 'base' || value === 'chain';
+const isLegacyMode = (value: unknown): value is NonNullable<SplunkQuery['mode']> =>
+  value === 'base' || value === 'chain';
 
 const resolveSearchType = (searchType: unknown, mode: unknown): EffectiveSearchType => {
   if (isSearchType(searchType)) {
@@ -132,25 +163,27 @@ class SplunkCustomVariableSupport extends CustomVariableSupport<
   }
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Generate a cache key that includes query parameters to ensure proper invalidation
+const clampSetting = (value: number | undefined, fallback: number, minimum: number, maximum: number) =>
+  Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, value!)) : fallback;
+
+const getDashboardNamespace = (options: DataQueryRequest<SplunkQuery>) =>
+  options.dashboardUID ?? options.dashboardTitle ?? `${options.app}:${options.panelId ?? 'unknown-panel'}`;
+
 function generateCacheKey(query: SplunkQuery, options: DataQueryRequest<SplunkQuery>): string {
-  const { range } = options;
-  const from = Math.floor(range!.from.valueOf() / 1000);
-  const to = Math.floor(range!.to.valueOf() / 1000);
-  
-  // Include query text, time range, and other relevant parameters in the cache key
-  const keyComponents = [
-    query.refId || '',
-    query.searchId || '',
-    query.queryText || '',
-    from.toString(),
-    to.toString(),
-    JSON.stringify(options.scopedVars || {})
-  ];
-  
-  return keyComponents.join('|');
+  const expandedQuery = getTemplateSrv()
+    .replace(query.queryText || '', options.scopedVars)
+    .trim();
+  const timeRange =
+    query.useDashboardTimeRange === false
+      ? [query.earliest || '-30d@d', query.latest || 'now']
+      : [
+          Math.floor(options.range.from.valueOf() / 1000).toString(),
+          Math.floor(options.range.to.valueOf() / 1000).toString(),
+        ];
+
+  return [getDashboardNamespace(options), query.searchId || query.refId || '', expandedQuery, ...timeRange].join('|');
 }
 
 export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptions> {
@@ -158,14 +191,46 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
   variables = new SplunkCustomVariableSupport(this);
   private readonly baseSearchCache: Map<string, BaseSearchResult> = new Map();
   private readonly baseSearchInflight: Map<string, Promise<BaseSearchResult>> = new Map();
+  private readonly standardSearchTimeoutMs: number;
+  private readonly baseSearchTimeoutMs: number;
+  private readonly chainSearchTimeoutMs: number;
+  private readonly cacheTtlMs: number;
+  private readonly maxResultRows: number;
+  private readonly maxResultPages: number;
+  private readonly maxResponseBytes: number;
+  private readonly debugLogging: boolean;
 
   constructor(instanceSettings: DataSourceInstanceSettings<SplunkDataSourceOptions>) {
     super(instanceSettings);
 
     this.url = instanceSettings.url;
+    const settings = instanceSettings.jsonData;
+    this.standardSearchTimeoutMs = clampSetting(settings.standardSearchTimeoutSeconds, 30, 1, 3600) * 1000;
+    this.baseSearchTimeoutMs = clampSetting(settings.baseSearchTimeoutSeconds, 120, 1, 3600) * 1000;
+    this.chainSearchTimeoutMs = clampSetting(settings.chainSearchTimeoutSeconds, 30, 1, 3600) * 1000;
+    this.cacheTtlMs = clampSetting(settings.baseSearchCacheTtlMinutes, 5, 0.1, 60) * 60 * 1000;
+    this.maxResultRows = clampSetting(settings.maxResultRows, DEFAULT_MAX_RESULT_ROWS, 1, 1_000_000);
+    this.maxResultPages = clampSetting(settings.maxResultPages, DEFAULT_MAX_RESULT_PAGES, 1, 1000);
+    this.maxResponseBytes = clampSetting(
+      settings.maxResponseBytes,
+      DEFAULT_MAX_RESPONSE_BYTES,
+      1024,
+      500 * 1024 * 1024
+    );
+    this.debugLogging = settings.debugLogging === true;
   }
 
-  async metricFindQuery(query: VariableQueryInput, options?: DataQueryRequest<SplunkQuery>): Promise<MetricFindValue[]> {
+  private debug(event: string, details: Record<string, unknown>) {
+    if (this.debugLogging) {
+      // eslint-disable-next-line no-console
+      console.debug(`[Splunk datasource] ${event}`, details);
+    }
+  }
+
+  async metricFindQuery(
+    query: VariableQueryInput,
+    options?: DataQueryRequest<SplunkQuery>
+  ): Promise<MetricFindValue[]> {
     const normalizedQuery = this.normalizeMetricFindQuery(query);
     if (!normalizedQuery) {
       return [];
@@ -232,7 +297,8 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
 
     return {
       ...(queryRecord as Partial<SplunkQuery>),
-      refId: typeof queryRecord.refId === 'string' && queryRecord.refId.length > 0 ? queryRecord.refId : 'metricFindQuery',
+      refId:
+        typeof queryRecord.refId === 'string' && queryRecord.refId.length > 0 ? queryRecord.refId : 'metricFindQuery',
       queryText,
       searchType,
       mode,
@@ -266,7 +332,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
   }
 
   async query(options: DataQueryRequest<SplunkQuery>): Promise<DataQueryResponse> {
-    // Clean up stale cache entries periodically
+    this.validateTargets(options.targets);
     this.cleanupStaleCache();
 
     const indexedTargets = options.targets.map((query, index) => ({ query, index }));
@@ -276,38 +342,29 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const resultFrames = new Array<PartialDataFrame | undefined>(options.targets.length);
 
     // Standard searches run first with bounded concurrency.
-    await mapWithConcurrency(
-      standardSearches,
-      MAX_QUERY_EXECUTION_CONCURRENCY,
-      async ({ query, index }) => {
-        const result = await this.doRequest(query, options);
-        resultFrames[index] = this.createDataFrame(query, result);
-      }
-    );
+    await mapWithConcurrency(standardSearches, MAX_QUERY_EXECUTION_CONCURRENCY, async ({ query, index }) => {
+      const result = await this.doRequest(query, options);
+      resultFrames[index] = this.createDataFrame(query, result);
+    });
 
     // Base searches run afterward with the same bounded concurrency.
-    await mapWithConcurrency(
-      baseSearches,
-      MAX_QUERY_EXECUTION_CONCURRENCY,
-      async ({ query, index }) => {
-        const completedResult = await this.resolveBaseSearch(query, options);
-        resultFrames[index] = this.createDataFrame(query, {
-          fields: completedResult.fields,
-          results: completedResult.results,
-          sid: completedResult.sid,
-        });
-      }
-    );
+    await mapWithConcurrency(baseSearches, MAX_QUERY_EXECUTION_CONCURRENCY, async ({ query, index }) => {
+      const resolved = await this.resolveBaseSearch(query, options);
+      const result = query.returnBaseResults
+        ? await this.doGetAllResultsRequest(resolved.result.sid, this.getRequestId(options, query, 'base-results'))
+        : defaultQueryRequestResults;
+      resultFrames[index] = this.createDataFrame(query, {
+        ...result,
+        sid: resolved.result.sid,
+        baseSearch: this.createBaseSearchMetadata(resolved),
+      });
+    });
 
     // Chain searches are also independent once base searches are available.
-    await mapWithConcurrency(
-      chainSearches,
-      MAX_QUERY_EXECUTION_CONCURRENCY,
-      async ({ query, index }) => {
-        const chainResult = await this.executeChainSearch(query, options);
-        resultFrames[index] = this.createDataFrame(query, chainResult);
-      }
-    );
+    await mapWithConcurrency(chainSearches, MAX_QUERY_EXECUTION_CONCURRENCY, async ({ query, index }) => {
+      const chainResult = await this.executeChainSearch(query, options);
+      resultFrames[index] = this.createDataFrame(query, chainResult);
+    });
 
     return { data: resultFrames.filter((frame): frame is PartialDataFrame => Boolean(frame)) };
   }
@@ -316,52 +373,134 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     return resolveSearchType(query.searchType, query.mode);
   }
 
+  private validateTargets(targets: SplunkQuery[]) {
+    const baseTargets = targets.filter((target) => this.resolveQuerySearchType(target) === 'base');
+    const baseIds = new Set<string>();
+
+    for (const target of baseTargets) {
+      const refId = target.refId.trim();
+      const searchId = target.searchId?.trim();
+      if (baseIds.has(refId) || (searchId && searchId !== refId && baseIds.has(searchId))) {
+        throw new Error(`Base search identifier "${searchId || refId}" must be unique.`);
+      }
+      baseIds.add(refId);
+      if (searchId) {
+        baseIds.add(searchId);
+      }
+
+      if (target.baseSearchRefId) {
+        throw new Error(`Base search "${searchId || refId}" cannot reference another base search.`);
+      }
+    }
+
+    for (const target of targets) {
+      const searchType = this.resolveQuerySearchType(target);
+      if (searchType === 'chain') {
+        const baseRef = target.baseSearchRefId?.trim();
+        if (!baseRef) {
+          throw new Error(`Chain search "${target.refId}" requires a base search reference.`);
+        }
+      } else if (searchType === 'standard' && (target.baseSearchRefId || target.searchId)) {
+        throw new Error(`Standard search "${target.refId}" cannot carry base or chain settings.`);
+      }
+    }
+  }
+
+  private getRequestId(options: DataQueryRequest<SplunkQuery>, query: SplunkQuery, operation: string): string {
+    return `splunk:${getDashboardNamespace(options)}:${options.panelId ?? 'unknown-panel'}:${query.refId}:${operation}`;
+  }
+
   private async resolveBaseSearch(
     query: SplunkQuery,
     options: DataQueryRequest<SplunkQuery>
-  ): Promise<BaseSearchResult> {
+  ): Promise<ResolvedBaseSearch> {
     const cacheKey = generateCacheKey(query, options);
 
     const cachedResult = this.findBaseSearchResult(cacheKey);
     if (cachedResult) {
-      return cachedResult;
+      this.debug('base cache hit', { cacheKey, sid: cachedResult.sid });
+      return { result: cachedResult, cache: 'hit' };
     }
+    this.debug('base cache miss', { cacheKey });
 
     const inflightPromise = this.baseSearchInflight.get(cacheKey);
 
     if (inflightPromise) {
-      return inflightPromise;
+      return { result: await inflightPromise, cache: 'inflight' };
     }
 
     const executeAndCacheBaseSearch = async (): Promise<BaseSearchResult> => {
-      const result = await this.doRequest(query, options);
-      const baseResult: BaseSearchResult = {
-        sid: result.sid || '',
-        searchId: query.searchId || query.refId,
-        refId: query.refId,
-        fields: result.fields,
-        results: result.results,
-        timestamp: Date.now(),
-        cacheKey,
-      };
+      const baseResult = await this.executeBaseSearch(query, options, cacheKey);
 
       this.baseSearchCache.set(cacheKey, baseResult);
-      this.baseSearchCache.set(query.refId, baseResult);
+      this.baseSearchCache.set(this.getBaseIdentifierKey(options, query.refId), baseResult);
       if (query.searchId) {
-        this.baseSearchCache.set(query.searchId, baseResult);
+        this.baseSearchCache.set(this.getBaseIdentifierKey(options, query.searchId), baseResult);
       }
 
       return baseResult;
     };
 
-    let newPromise = executeAndCacheBaseSearch();
-    newPromise = newPromise.finally(() => {
-      this.baseSearchInflight.delete(cacheKey);
-    });
-
+    const newPromise = executeAndCacheBaseSearch();
+    const identifierKeys = [
+      this.getBaseIdentifierKey(options, query.refId),
+      ...(query.searchId ? [this.getBaseIdentifierKey(options, query.searchId)] : []),
+    ];
     this.baseSearchInflight.set(cacheKey, newPromise);
+    identifierKeys.forEach((key) => this.baseSearchInflight.set(key, newPromise));
 
-    return newPromise;
+    try {
+      return { result: await newPromise, cache: 'miss' };
+    } finally {
+      [cacheKey, ...identifierKeys].forEach((key) => {
+        if (this.baseSearchInflight.get(key) === newPromise) {
+          this.baseSearchInflight.delete(key);
+        }
+      });
+    }
+  }
+
+  private async executeBaseSearch(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>,
+    cacheKey: string
+  ): Promise<BaseSearchResult> {
+    const startedAt = Date.now();
+    const requestId = this.getRequestId(options, query, 'base');
+    const searchResult = await this.doSearchRequest(query, options, requestId);
+    const sid = searchResult?.sid || '';
+
+    if (!sid) {
+      throw new Error(`Base search "${query.searchId || query.refId}" returned no SID.`);
+    }
+
+    try {
+      const status = await this.waitForSearchCompletion(
+        sid,
+        SEARCH_POLL_INTERVAL_MS,
+        this.baseSearchTimeoutMs,
+        requestId
+      );
+      this.assertSearchCompleted(sid, 'base', status, this.baseSearchTimeoutMs);
+    } catch (error) {
+      await this.cancelSearchJob(sid);
+      throw error;
+    }
+
+    const result = {
+      sid,
+      searchId: query.searchId || query.refId,
+      refId: query.refId,
+      timestamp: Date.now(),
+      cacheKey,
+      executionMs: Date.now() - startedAt,
+    };
+    this.debug('base execution complete', {
+      sid,
+      searchId: result.searchId,
+      executionMs: result.executionMs,
+    });
+    return result;
   }
 
   private async waitForBaseSearchInflight(
@@ -369,15 +508,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     options: DataQueryRequest<SplunkQuery>
   ): Promise<BaseSearchResult | null> {
     for (let attempt = 0; attempt < CHAIN_BASE_SEARCH_RETRY_ATTEMPTS; attempt++) {
-      const baseQueryTarget = options.targets.find(
-        target =>
-          this.resolveQuerySearchType(target) === 'base' &&
-          (target.searchId === baseSearchRefId || target.refId === baseSearchRefId)
-      );
-
-      const inflightPromise = baseQueryTarget
-        ? this.baseSearchInflight.get(generateCacheKey(baseQueryTarget, options))
-        : undefined;
+      const inflightPromise = this.baseSearchInflight.get(this.getBaseIdentifierKey(options, baseSearchRefId));
 
       if (inflightPromise) {
         try {
@@ -409,7 +540,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       throw new Error(`Chain search "${queryRefId}" requires baseSearchRefId and cannot run as a standard query.`);
     }
 
-    const cachedBaseSearch = this.findBaseSearchResultByRefId(baseSearchRefId);
+    const cachedBaseSearch = this.findBaseSearchResultByRefId(baseSearchRefId, options);
     if (cachedBaseSearch && this.isCacheValid(cachedBaseSearch)) {
       return cachedBaseSearch;
     }
@@ -421,7 +552,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
 
     throw new Error(
       `Chain search "${queryRefId}" could not resolve base search "${baseSearchRefId}". ` +
-      'No fallback to standalone search is applied by default to avoid semantic drift.'
+        'No fallback to standalone search is applied by default to avoid semantic drift.'
     );
   }
 
@@ -429,16 +560,37 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     query: SplunkQuery,
     options: DataQueryRequest<SplunkQuery>
   ): Promise<QueryRequestResults> {
-    const baseSearch = await this.resolveChainBaseSearch(query, options);
-    return this.doChainRequest(query, options, baseSearch);
+    let baseSearch = await this.resolveChainBaseSearch(query, options);
+    let cache: BaseSearchMetadata['cache'] = 'hit';
+
+    if (!(await this.searchJobExists(baseSearch.sid, this.getRequestId(options, query, 'base-status')))) {
+      this.debug('cached SID missing', { sid: baseSearch.sid, searchId: baseSearch.searchId });
+      this.deleteBaseSearch(baseSearch);
+      const baseQuery = options.targets.find(
+        (target) =>
+          this.resolveQuerySearchType(target) === 'base' &&
+          (target.searchId === query.baseSearchRefId || target.refId === query.baseSearchRefId)
+      );
+      if (!baseQuery) {
+        throw new Error(`Base search "${query.baseSearchRefId}" is unavailable and cannot be rerun.`);
+      }
+      const rerun = await this.resolveBaseSearch(baseQuery, options);
+      baseSearch = rerun.result;
+      cache = 'miss';
+      this.debug('base SID retry', { sid: baseSearch.sid, searchId: baseSearch.searchId });
+    }
+
+    const result = await this.doChainRequest(query, options, baseSearch);
+    result.baseSearch = this.createBaseSearchMetadata({ result: baseSearch, cache });
+    return result;
   }
-  
+
   private createDataFrame(query: SplunkQuery, response: QueryRequestResults) {
     // Prepare fields with proper typing
     const fields = response.fields.map((fieldName: any) => {
       const values: any[] = [];
       let fieldType = FieldType.string;
-      
+
       // First pass: collect values
       response.results.forEach((result: any) => {
         if (fieldName === '_time') {
@@ -453,28 +605,28 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           values.push(result[fieldName]);
         }
       });
-      
+
       // Determine field type based on content
       if (fieldName === '_time') {
         fieldType = FieldType.time;
       } else {
         // Check if all non-null values are purely numeric (not mixed text/numbers)
-        const nonNullValues = values.filter(v => v !== null && v !== undefined && v !== '');
+        const nonNullValues = values.filter((v) => v !== null && v !== undefined && v !== '');
         if (nonNullValues.length > 0) {
-          const allNumeric = nonNullValues.every(v => {
+          const allNumeric = nonNullValues.every((v) => {
             // Convert to string to check if it's purely numeric
             const strValue = String(v).trim();
             // Check if the string contains only digits, decimal points, minus signs, and scientific notation
             const numericPattern = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
             const isNumericString = numericPattern.test(strValue);
-            
+
             if (isNumericString) {
               const num = parseFloat(strValue);
               return !isNaN(num) && isFinite(num);
             }
             return false;
           });
-          
+
           if (allNumeric) {
             fieldType = FieldType.number;
             // Convert string numbers to actual numbers, preserving precision
@@ -489,7 +641,7 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           }
         }
       }
-      
+
       return {
         name: fieldName,
         type: fieldType,
@@ -500,48 +652,77 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     const frame: PartialDataFrame = {
       refId: query.refId,
       fields: fields,
+      meta: {
+        custom: response.baseSearch ? { baseSearch: response.baseSearch } : undefined,
+        notices: response.warning ? [{ severity: 'warning', text: response.warning, inspect: 'data' }] : undefined,
+      },
     };
 
     return frame;
   }
-  
+
   private findBaseSearchResult(cacheKey: string): BaseSearchResult | null {
     const cachedResult = this.baseSearchCache.get(cacheKey);
     if (cachedResult && this.isCacheValid(cachedResult)) {
       return cachedResult;
     } else if (cachedResult && !this.isCacheValid(cachedResult)) {
-      // Remove stale cache entry
-      this.baseSearchCache.delete(cacheKey);
+      this.deleteBaseSearch(cachedResult);
     }
     return null;
   }
-  
-  private findBaseSearchResultByRefId(baseSearchRefId: string): BaseSearchResult | null {
-    const cachedResult = this.baseSearchCache.get(baseSearchRefId);
+
+  private getBaseIdentifierKey(options: DataQueryRequest<SplunkQuery>, identifier: string): string {
+    return `${getDashboardNamespace(options)}:${identifier}`;
+  }
+
+  private findBaseSearchResultByRefId(
+    baseSearchRefId: string,
+    options: DataQueryRequest<SplunkQuery>
+  ): BaseSearchResult | null {
+    const identifierKey = this.getBaseIdentifierKey(options, baseSearchRefId);
+    const cachedResult = this.baseSearchCache.get(identifierKey);
     if (cachedResult && this.isCacheValid(cachedResult)) {
       return cachedResult;
     } else if (cachedResult && !this.isCacheValid(cachedResult)) {
-      // Remove stale cache entry
-      this.baseSearchCache.delete(baseSearchRefId);
+      this.deleteBaseSearch(cachedResult);
     }
     return null;
   }
-  
-  private isCacheValid(cached: BaseSearchResult): boolean {
-    return (Date.now() - cached.timestamp) < CACHE_TTL;
+
+  private createBaseSearchMetadata(resolved: ResolvedBaseSearch): BaseSearchMetadata {
+    return {
+      searchId: resolved.result.searchId,
+      sid: resolved.result.sid,
+      cache: resolved.cache,
+      ageMs: Date.now() - resolved.result.timestamp,
+      executionMs: resolved.result.executionMs,
+    };
   }
-  
+
+  private deleteBaseSearch(result: BaseSearchResult) {
+    for (const [key, value] of this.baseSearchCache) {
+      if (value.cacheKey === result.cacheKey) {
+        this.baseSearchCache.delete(key);
+      }
+    }
+  }
+
+  private isCacheValid(cached: BaseSearchResult): boolean {
+    return Date.now() - cached.timestamp < this.cacheTtlMs;
+  }
+
   private cleanupStaleCache(): void {
     const now = Date.now();
     const keysToDelete: string[] = [];
-    
+
     for (const [key, result] of this.baseSearchCache.entries()) {
-      if ((now - result.timestamp) >= CACHE_TTL) {
+      if (now - result.timestamp >= this.cacheTtlMs) {
         keysToDelete.push(key);
+        this.debug('base cache expired', { sid: result.sid, searchId: result.searchId });
       }
     }
-    
-    keysToDelete.forEach(key => {
+
+    keysToDelete.forEach((key) => {
       this.baseSearchCache.delete(key);
     });
   }
@@ -549,13 +730,16 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
   private async waitForSearchCompletion(
     sid: string,
     pollIntervalMs: number = SEARCH_POLL_INTERVAL_MS,
-    timeoutMs: number = SEARCH_POLL_TIMEOUT_MS
-  ): Promise<boolean> {
+    timeoutMs: number = DEFAULT_STANDARD_SEARCH_TIMEOUT_MS,
+    requestId?: string
+  ): Promise<SearchStatus> {
     const deadline = Date.now() + timeoutMs;
+    let status: SearchStatus = { state: 'RUNNING', messages: [] };
 
     while (Date.now() < deadline) {
-      if (await this.doSearchStatusRequest(sid)) {
-        return true;
+      status = await this.doSearchStatusRequest(sid, requestId);
+      if (TERMINAL_SEARCH_STATES.has(status.state)) {
+        return status;
       }
 
       const remainingMs = deadline - Date.now();
@@ -566,7 +750,54 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       await delay(Math.min(pollIntervalMs, remainingMs));
     }
 
-    return this.doSearchStatusRequest(sid);
+    return this.doSearchStatusRequest(sid, requestId);
+  }
+
+  private assertSearchCompleted(
+    sid: string,
+    searchType: 'standard' | 'base' | 'chain',
+    status: SearchStatus,
+    timeoutMs: number
+  ) {
+    if (status.state === 'FAILED') {
+      this.debug('Splunk dispatch failure', { sid, messages: status.messages });
+      throw new SplunkSearchFailedError(sid, status.messages);
+    }
+    if (status.state !== 'DONE' && status.state !== 'PAUSED') {
+      throw new SplunkSearchTimeoutError(sid, searchType, timeoutMs);
+    }
+  }
+
+  private async searchJobExists(sid: string, requestId?: string): Promise<boolean> {
+    try {
+      const status = await this.doSearchStatusRequest(sid, requestId);
+      return status.state !== 'FAILED';
+    } catch (error: any) {
+      if (error?.status === 404 || error?.statusText === 'Not Found') {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async cancelSearchJob(sid: string) {
+    try {
+      await lastValueFrom(
+        getBackendSrv().fetch({
+          method: 'POST',
+          url: `${this.url}/services/search/jobs/${encodeURIComponent(sid)}/control`,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          data: new URLSearchParams({ action: 'cancel' }).toString(),
+          showErrorAlert: false,
+          requestId: `splunk-cancel:${sid}`,
+        })
+      );
+      this.debug('cancelled Splunk job', { sid });
+    } catch {
+      this.debug('failed to cancel Splunk job', { sid });
+    }
   }
 
   async testDatasource() {
@@ -578,14 +809,14 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
 
     try {
       await lastValueFrom(
-        (getBackendSrv().fetch<any>({
+        getBackendSrv().fetch<any>({
           method: 'POST',
           url: this.url + '/services/search/jobs',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
           data: data,
-        }) as any)
+        }) as any
       );
       return {
         status: 'success',
@@ -601,72 +832,110 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     }
   }
 
-  async doSearchStatusRequest(sid: string) {
+  async doSearchStatusRequest(sid: string, requestId?: string): Promise<SearchStatus> {
     const response: any = await lastValueFrom(
-      (getBackendSrv().fetch<any>({
+      getBackendSrv().fetch<any>({
         method: 'GET',
-        url: this.url + '/services/search/jobs/' + sid,
+        url: this.url + '/services/search/jobs/' + encodeURIComponent(sid),
         params: {
           output_mode: 'json',
         },
-      }) as any)
+        requestId,
+        validatePath: true,
+      }) as any
     );
-    let status = (response.data as any).entry[0].content.dispatchState;
-    return status === 'DONE' || status === 'PAUSED' || status === 'FAILED';
+    const entry = response.data?.entry?.[0];
+    const messages = [response.data?.messages, entry?.content?.messages]
+      .flatMap((value) => (Array.isArray(value) ? value : value ? [value] : []))
+      .map((message: any) => message?.text || message?.message || String(message))
+      .filter(Boolean);
+    return {
+      state: entry?.content?.dispatchState || 'UNKNOWN',
+      messages,
+    };
   }
 
-  async doSearchRequest(query: SplunkQuery, options: DataQueryRequest<SplunkQuery>): Promise<{sid: string} | null> {
+  async doSearchRequest(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>,
+    requestId?: string
+  ): Promise<{ sid: string } | null> {
     if ((query.queryText || '').trim().length < 4) {
       return null;
     }
-    const { range } = options;
-    const from = Math.floor(range!.from.valueOf() / 1000);
-    const to = Math.floor(range!.to.valueOf() / 1000);
+    const useDashboardTimeRange = query.useDashboardTimeRange !== false;
+    const from = useDashboardTimeRange
+      ? Math.floor(options.range.from.valueOf() / 1000).toString()
+      : query.earliest || '-30d@d';
+    const to = useDashboardTimeRange ? Math.floor(options.range.to.valueOf() / 1000).toString() : query.latest || 'now';
     const prefix = (query.queryText || ' ')[0].trim() === '|' ? '' : 'search';
     const queryWithVars = getTemplateSrv().replace(`${prefix} ${query.queryText}`.trim(), options.scopedVars);
     const data = new URLSearchParams({
       search: queryWithVars,
       output_mode: 'json',
-      earliest_time: from.toString(),
-      latest_time: to.toString(),
+      earliest_time: from,
+      latest_time: to,
     }).toString();
     const response: any = await lastValueFrom(
-      (getBackendSrv().fetch<any>({
+      getBackendSrv().fetch<any>({
         method: 'POST',
         url: this.url + '/services/search/jobs',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         data: data,
-      }) as any)
+        requestId,
+      }) as any
     );
     const sid: string = (response.data as any).sid;
     return { sid };
   }
 
-  async doGetAllResultsRequest(sid: string) {
-    const count = 50000;
+  async doGetAllResultsRequest(sid: string, requestId?: string): Promise<QueryRequestResults> {
+    const pageSize = 50_000;
     let offset = 0;
     let isFirst = true;
     let isFinished = false;
     let fields: any[] = [];
     let results: any[] = [];
+    let pages = 0;
+    let responseBytes = 0;
+    let warning: string | undefined;
 
     while (!isFinished) {
+      if (pages >= this.maxResultPages) {
+        warning = `Splunk results truncated at ${this.maxResultPages} pages.`;
+        break;
+      }
+      const remainingRows = this.maxResultRows - results.length;
+      if (remainingRows <= 0) {
+        warning = `Splunk results truncated at ${this.maxResultRows} rows.`;
+        break;
+      }
+
       const response: any = await lastValueFrom(
-        (getBackendSrv().fetch<any>({
+        getBackendSrv().fetch<any>({
           method: 'GET',
-          url: this.url + '/services/search/jobs/' + sid + '/results',
+          url: this.url + '/services/search/jobs/' + encodeURIComponent(sid) + '/results',
           params: {
             output_mode: 'json',
             offset: offset,
-            count: count,
+            count: Math.min(pageSize, remainingRows),
           },
-        }) as any)
+          requestId,
+          validatePath: true,
+        }) as any
       );
 
       const responseData = response.data as any;
       const pageResults: any[] = responseData.results || [];
+      pages += 1;
+      responseBytes += new Blob([JSON.stringify(responseData)]).size;
+
+      if (responseBytes > this.maxResponseBytes) {
+        warning = `Splunk results truncated after responses exceeded ${this.maxResponseBytes} bytes.`;
+        break;
+      }
 
       if (pageResults.length === 0) {
         isFinished = true;
@@ -675,8 +944,13 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
           isFirst = false;
           fields = (responseData.fields || []).map((field: any) => field['name']);
         }
-        results = results.concat(pageResults);
-        offset = offset + pageResults.length;
+        const retainedResults = pageResults.slice(0, remainingRows);
+        results = results.concat(retainedResults);
+        offset += pageResults.length;
+        if (results.length >= this.maxResultRows) {
+          warning = `Splunk results truncated at ${this.maxResultRows} rows.`;
+          break;
+        }
       }
     }
 
@@ -688,32 +962,50 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       fields = fields.reverse();
     }
 
-    return { fields: fields, results: results };
+    this.debug('result retrieval complete', { sid, rows: results.length, pages, responseBytes, warning });
+    return { fields, results, warning };
   }
 
-  async doRequest(query: SplunkQuery, options: DataQueryRequest<SplunkQuery>): Promise<QueryRequestResults & { sid?: string }> {
-    const searchResult = await this.doSearchRequest(query, options);
+  async doRequest(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>
+  ): Promise<QueryRequestResults & { sid?: string }> {
+    const requestId = this.getRequestId(options, query, 'standard');
+    const searchResult = await this.doSearchRequest(query, options, requestId);
     const sid: string = searchResult?.sid || '';
     if (sid.length > 0) {
-      const isComplete = await this.waitForSearchCompletion(sid);
-      if (!isComplete) {
-        throw new SplunkSearchTimeoutError(sid, 'standard', SEARCH_POLL_TIMEOUT_MS);
-      }
+      try {
+        const status = await this.waitForSearchCompletion(
+          sid,
+          SEARCH_POLL_INTERVAL_MS,
+          this.standardSearchTimeoutMs,
+          requestId
+        );
+        this.assertSearchCompleted(sid, 'standard', status, this.standardSearchTimeoutMs);
 
-      const result = await this.doGetAllResultsRequest(sid);
-      return { ...result, sid };
+        const result = await this.doGetAllResultsRequest(sid, requestId);
+        return { ...result, sid };
+      } catch (error) {
+        await this.cancelSearchJob(sid);
+        throw error;
+      }
     }
     return defaultQueryRequestResults;
   }
 
-  async doChainRequest(query: SplunkQuery, options: DataQueryRequest<SplunkQuery>, baseSearch: BaseSearchResult): Promise<QueryRequestResults> {
+  async doChainRequest(
+    query: SplunkQuery,
+    options: DataQueryRequest<SplunkQuery>,
+    baseSearch: BaseSearchResult
+  ): Promise<QueryRequestResults> {
     if ((query.queryText || '').trim().length < 1) {
       return defaultQueryRequestResults;
     }
-    
-    const { range } = options;
-    const from = Math.floor(range!.from.valueOf() / 1000);
-    const to = Math.floor(range!.to.valueOf() / 1000);
+
+    const from = Math.floor(options.range.from.valueOf() / 1000);
+    const to = Math.floor(options.range.to.valueOf() / 1000);
+    const requestId = this.getRequestId(options, query, 'chain');
+    const startedAt = Date.now();
 
     let chainQuery = query.queryText.trim();
     if (baseSearch.sid) {
@@ -737,24 +1029,39 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
 
     try {
       const response: any = await lastValueFrom(
-        (getBackendSrv().fetch<any>({
+        getBackendSrv().fetch<any>({
           method: 'POST',
           url: this.url + '/services/search/jobs',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
           data: data,
-        }) as any)
+          requestId,
+        }) as any
       );
       const sid: string = (response.data as any)?.sid ?? '';
       if (sid.length > 0) {
-        const isComplete = await this.waitForSearchCompletion(sid);
-        if (!isComplete) {
-          throw new SplunkSearchTimeoutError(sid, 'chain', SEARCH_POLL_TIMEOUT_MS);
-        }
+        try {
+          const status = await this.waitForSearchCompletion(
+            sid,
+            SEARCH_POLL_INTERVAL_MS,
+            this.chainSearchTimeoutMs,
+            requestId
+          );
+          this.assertSearchCompleted(sid, 'chain', status, this.chainSearchTimeoutMs);
 
-        const result = await this.doGetAllResultsRequest(sid);
-        return result;
+          const result = await this.doGetAllResultsRequest(sid, requestId);
+          this.debug('chain execution complete', {
+            sid,
+            baseSid: baseSearch.sid,
+            executionMs: Date.now() - startedAt,
+            rows: result.results.length,
+          });
+          return result;
+        } catch (error) {
+          await this.cancelSearchJob(sid);
+          throw error;
+        }
       }
 
       throw new Error(`Chain search "${query.refId || 'unknown'}" returned an empty SID.`);

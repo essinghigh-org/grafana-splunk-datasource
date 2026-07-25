@@ -53,11 +53,14 @@ jest.mock('@grafana/data', () => {
 jest.mock('@grafana/runtime', () => ({
   getBackendSrv: jest.fn(),
   getTemplateSrv: jest.fn(() => ({
-    replace: (value: string) => value,
+    replace: (value: string, scopedVars: Record<string, { value?: unknown }> = {}) =>
+      value.replace(/\$\{([^}]+)\}/g, (match, name) =>
+        scopedVars[name]?.value === undefined ? match : String(scopedVars[name].value)
+      ),
   })),
 }));
 
-const createDataSource = () => {
+const createDataSource = (jsonData: SplunkDataSourceOptions = {}) => {
   const settings = {
     id: 1,
     uid: 'splunk-test',
@@ -65,7 +68,7 @@ const createDataSource = () => {
     name: 'Splunk',
     access: 'proxy',
     url: 'http://localhost',
-    jsonData: {},
+    jsonData,
   } as DataSourceInstanceSettings<SplunkDataSourceOptions>;
 
   return new DataSource(settings);
@@ -74,6 +77,7 @@ const createDataSource = () => {
 const createQueryRequest = (targets: any[] = []) =>
   ({
     app: 'dashboard',
+    dashboardUID: 'dashboard-1',
     requestId: 'runtime-test',
     timezone: 'utc',
     interval: '1m',
@@ -309,6 +313,25 @@ describe('DataSource runtime pagination', () => {
       { _time: '2024-01-01T00:03:00Z', host: 'api-4' },
     ]);
   });
+
+  it('stops at the configured row limit and returns a truncation warning', async () => {
+    const datasource = createDataSource({ maxResultRows: 3 });
+    const fetchMock = jest.fn().mockReturnValue(
+      of({
+        data: {
+          fields: [{ name: 'host' }],
+          results: [{ host: 'api-1' }, { host: 'api-2' }, { host: 'api-3' }],
+        },
+      })
+    );
+    mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
+
+    const result = await datasource.doGetAllResultsRequest('sid-limited');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.results).toHaveLength(3);
+    expect(result.warning).toBe('Splunk results truncated at 3 rows.');
+  });
 });
 
 describe('DataSource runtime polling', () => {
@@ -318,19 +341,24 @@ describe('DataSource runtime polling', () => {
 
   it('times out waiting for search completion using bounded polling', async () => {
     const datasource = createDataSource();
-    const statusSpy = jest.spyOn(datasource, 'doSearchStatusRequest').mockResolvedValue(false);
+    const statusSpy = jest
+      .spyOn(datasource, 'doSearchStatusRequest')
+      .mockResolvedValue({ state: 'RUNNING', messages: [] });
 
     const completed = await (datasource as any).waitForSearchCompletion('sid-timeout', 1, 5);
 
-    expect(completed).toBe(false);
+    expect(completed).toEqual({ state: 'RUNNING', messages: [] });
     expect(statusSpy).toHaveBeenCalled();
   });
 
   it('uses bounded polling helper in standard request flow', async () => {
     const datasource = createDataSource();
     jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-standard' });
-    const waitSpy = jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue(false);
+    const waitSpy = jest
+      .spyOn(datasource as any, 'waitForSearchCompletion')
+      .mockResolvedValue({ state: 'RUNNING', messages: [] });
     const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+    const cancelSpy = jest.spyOn(datasource as any, 'cancelSearchJob').mockResolvedValue(undefined);
 
     await expect(
       datasource.doRequest(
@@ -344,15 +372,59 @@ describe('DataSource runtime polling', () => {
       searchType: 'standard',
     });
 
-    expect(waitSpy).toHaveBeenCalledWith('sid-standard');
+    expect(waitSpy).toHaveBeenCalledWith('sid-standard', 100, 30_000, 'splunk:dashboard-1:unknown-panel:A:standard');
     expect(getAllSpy).not.toHaveBeenCalled();
+    expect(cancelSpy).toHaveBeenCalledWith('sid-standard');
+  });
+
+  it('surfaces Splunk failure messages instead of fetching results', async () => {
+    const datasource = createDataSource();
+    jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-failed' });
+    jest
+      .spyOn(datasource as any, 'waitForSearchCompletion')
+      .mockResolvedValue({ state: 'FAILED', messages: ['Invalid search command'] });
+    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+    jest.spyOn(datasource as any, 'cancelSearchJob').mockResolvedValue(undefined);
+
+    await expect(
+      datasource.doRequest(
+        { refId: 'A', queryText: 'index=_internal', searchType: 'standard' } as any,
+        createQueryRequest([{ refId: 'A' }])
+      )
+    ).rejects.toThrow('Splunk search failed (sid=sid-failed): Invalid search command');
+
+    expect(getAllSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends explicit fixed times for a base search', async () => {
+    const datasource = createDataSource();
+    const fetchMock = jest.fn().mockReturnValue(of({ data: { sid: 'sid-base' } }));
+    mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
+
+    await datasource.doSearchRequest(
+      {
+        refId: 'A',
+        queryText: 'index=_internal',
+        searchType: 'base',
+        useDashboardTimeRange: false,
+        earliest: '-30d@d',
+        latest: 'now',
+      },
+      createQueryRequest([])
+    );
+
+    const body = new URLSearchParams(fetchMock.mock.calls[0][0].data);
+    expect(body.get('earliest_time')).toBe('-30d@d');
+    expect(body.get('latest_time')).toBe('now');
   });
 
   it('uses bounded polling helper in chain flow and surfaces timeout failures', async () => {
     const datasource = createDataSource();
     const fetchMock = jest.fn().mockReturnValue(of({ data: { sid: 'sid-chain' } }));
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
-    const waitSpy = jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue(false);
+    const waitSpy = jest
+      .spyOn(datasource as any, 'waitForSearchCompletion')
+      .mockResolvedValue({ state: 'RUNNING', messages: [] });
     const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
 
     const baseSearch = {
@@ -363,6 +435,7 @@ describe('DataSource runtime polling', () => {
       results: [{ host: 'api-1' }],
       timestamp: Date.now(),
       cacheKey: 'base-cache-key',
+      executionMs: 1,
     };
 
     await expect(
@@ -373,7 +446,7 @@ describe('DataSource runtime polling', () => {
       )
     ).rejects.toThrow('Splunk chain search timed out after 30000ms (sid=sid-chain).');
 
-    expect(waitSpy).toHaveBeenCalledWith('sid-chain');
+    expect(waitSpy).toHaveBeenCalledWith('sid-chain', 100, 30_000, 'splunk:dashboard-1:unknown-panel:B:chain');
     expect(getAllSpy).not.toHaveBeenCalled();
   });
 
@@ -393,6 +466,7 @@ describe('DataSource runtime polling', () => {
       results: [{ host: 'api-1' }],
       timestamp: Date.now(),
       cacheKey: 'base-cache-key',
+      executionMs: 1,
     };
 
     await expect(
@@ -419,6 +493,7 @@ describe('DataSource runtime polling', () => {
       results: [{ host: 'api-1' }],
       timestamp: Date.now(),
       cacheKey: 'base-cache-key',
+      executionMs: 1,
     };
 
     let thrown: unknown;
@@ -445,15 +520,28 @@ describe('DataSource runtime polling', () => {
 describe('DataSource query orchestration', () => {
   it('runs base searches before chains but returns frames in target order', async () => {
     const datasource = createDataSource();
+    const calls: string[] = [];
 
-    jest.spyOn(datasource, 'doRequest').mockImplementation(async query => ({
-      sid: `sid-${query.refId}`,
-      fields: ['value'],
-      results: [{ value: `${query.refId}-value` }],
-    }));
-    const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({
-      fields: ['value'],
-      results: [{ value: 'C-value' }],
+    jest.spyOn(datasource, 'doRequest').mockImplementation(async (query) => {
+      calls.push(`standard:${query.refId}`);
+      return { fields: ['value'], results: [{ value: `${query.refId}-value` }] };
+    });
+    jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(async (...args: any[]) => {
+      const [query, _options, cacheKey] = args;
+      calls.push(`base:${query.refId}`);
+      return {
+        sid: `sid-${query.refId}`,
+        searchId: query.searchId,
+        refId: query.refId,
+        timestamp: Date.now(),
+        cacheKey,
+        executionMs: 1,
+      };
+    });
+    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockImplementation(async () => {
+      calls.push('chain:C');
+      return { fields: ['value'], results: [{ value: 'C-value' }] };
     });
 
     const response = await datasource.query(
@@ -478,11 +566,83 @@ describe('DataSource query orchestration', () => {
       ])
     );
 
-    expect(response.data.map(frame => frame.refId)).toEqual(['C', 'A', 'B']);
+    expect(response.data.map((frame) => frame.refId)).toEqual(['C', 'A', 'B']);
+    expect(calls).toEqual(['standard:A', 'base:B', 'chain:C']);
     expect(chainSpy).toHaveBeenCalledWith(
       expect.objectContaining({ refId: 'C' }),
       expect.anything(),
       expect.objectContaining({ refId: 'B', searchId: 'base-search', sid: 'sid-B' })
+    );
+  });
+
+  it('does not download hidden base results and exposes base metadata', async () => {
+    const datasource = createDataSource();
+    jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-base' });
+    jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue({ state: 'DONE', messages: [] });
+    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+
+    const response = await datasource.query(
+      createQueryRequest([
+        {
+          refId: 'A',
+          queryText: 'index=_internal',
+          searchType: 'base',
+          searchId: 'base-search',
+        },
+      ])
+    );
+
+    expect(getAllSpy).not.toHaveBeenCalled();
+    expect(response.data[0].fields).toEqual([]);
+    expect(response.data[0].meta?.custom?.baseSearch).toEqual(
+      expect.objectContaining({ searchId: 'base-search', sid: 'sid-base', cache: 'miss' })
+    );
+  });
+
+  it('resolves a base search running in another panel on the same dashboard', async () => {
+    const datasource = createDataSource();
+    jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(
+      async (...args: any[]) =>
+        new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                sid: 'sid-external-base',
+                searchId: 'snow-base',
+                refId: 'A',
+                timestamp: Date.now(),
+                cacheKey: args[2],
+                executionMs: 10,
+              }),
+            10
+          )
+        )
+    );
+    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
+
+    await Promise.all([
+      datasource.query(
+        createQueryRequest([
+          { refId: 'A', queryText: 'index=servicenow', searchType: 'base', searchId: 'snow-base' },
+        ])
+      ),
+      datasource.query(
+        createQueryRequest([
+          {
+            refId: 'A',
+            queryText: '| stats count by updater',
+            searchType: 'chain',
+            baseSearchRefId: 'snow-base',
+          },
+        ])
+      ),
+    ]);
+
+    expect(chainSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ baseSearchRefId: 'snow-base' }),
+      expect.anything(),
+      expect.objectContaining({ sid: 'sid-external-base', searchId: 'snow-base' })
     );
   });
 });
@@ -492,16 +652,19 @@ describe('DataSource base-search state isolation', () => {
     const datasourceA = createDataSource();
     const datasourceB = createDataSource();
 
-    let resolveA!: (value: QueryRequestResults & { sid?: string }) => void;
-    const pendingA = new Promise<QueryRequestResults & { sid?: string }>((resolve) => {
+    let resolveA!: (value: any) => void;
+    const pendingA = new Promise<any>((resolve) => {
       resolveA = resolve;
     });
 
-    const doRequestASpy = jest.spyOn(datasourceA, 'doRequest').mockReturnValue(pendingA as any);
-    const doRequestBSpy = jest.spyOn(datasourceB, 'doRequest').mockResolvedValue({
+    const executeASpy = jest.spyOn(datasourceA as any, 'executeBaseSearch').mockReturnValue(pendingA);
+    const executeBSpy = jest.spyOn(datasourceB as any, 'executeBaseSearch').mockResolvedValue({
       sid: 'sid-b',
-      fields: ['host'],
-      results: [{ host: 'api-b' }],
+      searchId: 'shared-base',
+      refId: 'A',
+      timestamp: Date.now(),
+      cacheKey: 'cache-b',
+      executionMs: 1,
     });
 
     const baseTarget = {
@@ -517,42 +680,44 @@ describe('DataSource base-search state isolation', () => {
     const queryBPromise = datasourceB.query(createQueryRequest([baseTarget]));
     await Promise.resolve();
 
-    expect(doRequestBSpy).toHaveBeenCalledTimes(1);
+    expect(executeBSpy).toHaveBeenCalledTimes(1);
 
     resolveA({
       sid: 'sid-a',
-      fields: ['host'],
-      results: [{ host: 'api-a' }],
+      searchId: 'shared-base',
+      refId: 'A',
+      timestamp: Date.now(),
+      cacheKey: 'cache-a',
+      executionMs: 1,
     });
 
     await queryAPromise;
     await queryBPromise;
 
-    expect(doRequestASpy).toHaveBeenCalledTimes(1);
-    expect(doRequestBSpy).toHaveBeenCalledTimes(1);
+    expect(executeASpy).toHaveBeenCalledTimes(1);
+    expect(executeBSpy).toHaveBeenCalledTimes(1);
   });
 
   it('does not reuse inflight base search when different base queries share the same searchId', async () => {
     const datasource = createDataSource();
 
-    const doRequestSpy = jest.spyOn(datasource, 'doRequest').mockImplementation(
-      async (query, options) =>
-        await new Promise<any>((resolve) => {
-          const delayMs = query.refId === 'A' ? 40 : 10;
+    const executeSpy = jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(async (...args: any[]) => {
+      const [query, _options, cacheKey] = args;
+      return await new Promise<any>((resolve) => {
+        const delayMs = query.refId === 'A' ? 40 : 10;
 
-          setTimeout(() => {
-            resolve({
-              fields: ['value'],
-              results: [
-                {
-                  value: `${query.refId}:${query.queryText}:${options.range.from.valueOf()}-${options.range.to.valueOf()}`,
-                },
-              ],
-              sid: `sid-${query.refId}-${options.range.from.valueOf()}-${options.range.to.valueOf()}`,
-            });
-          }, delayMs);
-        })
-    );
+        setTimeout(() => {
+          resolve({
+            sid: `sid-${query.refId}`,
+            searchId: query.searchId,
+            refId: query.refId,
+            timestamp: Date.now(),
+            cacheKey,
+            executionMs: delayMs,
+          });
+        }, delayMs);
+      });
+    });
 
     const firstRequest = createQueryRequest([
       {
@@ -581,19 +746,173 @@ describe('DataSource base-search state isolation', () => {
       },
     };
 
-    const [firstResponse, secondResponse] = await Promise.all([
-      datasource.query(firstRequest),
-      datasource.query(secondRequest),
+    await Promise.all([datasource.query(firstRequest), datasource.query(secondRequest)]);
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(executeSpy.mock.calls.map(([queryArg]: any[]) => queryArg.refId).sort()).toEqual(['A', 'B']);
+  });
+});
+
+describe('DataSource base-search cache behavior', () => {
+  const baseTarget = {
+    refId: 'A',
+    queryText: 'index=main host=${baseHost}',
+    searchType: 'base',
+    searchId: 'shared-base',
+    useDashboardTimeRange: false,
+    earliest: '-30d@d',
+    latest: 'now',
+  };
+  const chainTarget = {
+    refId: 'B',
+    queryText: '| search service=${chainService} | stats count',
+    searchType: 'chain',
+    baseSearchRefId: 'shared-base',
+  };
+
+  const setVariables = (request: any, baseHost: string, chainService: string) => {
+    request.scopedVars = {
+      baseHost: { value: baseHost, text: baseHost },
+      chainService: { value: chainService, text: chainService },
+    };
+    return request;
+  };
+
+  const mockBaseAndChain = (datasource: DataSource) => {
+    const executeSpy = jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(async (...args: any[]) => {
+      const [query, _options, cacheKey] = args;
+      return {
+        sid: `sid-${executeSpy.mock.calls.length}`,
+        searchId: query.searchId || query.refId,
+        refId: query.refId,
+        timestamp: Date.now(),
+        cacheKey,
+        executionMs: 1,
+      };
+    });
+    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
+    return executeSpy;
+  };
+
+  it('reuses the base when only a chain variable changes', async () => {
+    const datasource = createDataSource();
+    const executeSpy = mockBaseAndChain(datasource);
+
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('reruns the base when a variable referenced by the base changes', async () => {
+    const datasource = createDataSource();
+    const executeSpy = mockBaseAndChain(datasource);
+
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-2', 'api'));
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses a fixed-range base when the dashboard range changes', async () => {
+    const datasource = createDataSource();
+    const executeSpy = mockBaseAndChain(datasource);
+    const first = setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api');
+    const second = setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api');
+    second.range = {
+      from: { valueOf: () => 3000 },
+      to: { valueOf: () => 4000 },
+      raw: { from: 'now-10m', to: 'now-5m' },
+    };
+
+    await datasource.query(first);
+    await datasource.query(second);
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not collide across dashboards that use the same search ID', async () => {
+    const datasource = createDataSource();
+    const executeSpy = mockBaseAndChain(datasource);
+    const first = setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api');
+    const second = setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api');
+    first.dashboardUID = 'dashboard-a';
+    second.dashboardUID = 'dashboard-b';
+
+    await datasource.query(first);
+    await datasource.query(second);
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('reruns an expired base cache entry', async () => {
+    const datasource = createDataSource({ baseSearchCacheTtlMinutes: 0.1 });
+    const executeSpy = mockBaseAndChain(datasource);
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    nowSpy.mockReturnValue(1_007_000);
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    nowSpy.mockRestore();
+  });
+
+  it('deduplicates concurrent base executions', async () => {
+    const datasource = createDataSource();
+    const executeSpy = jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(async (...args: any[]) => {
+      const [query, _options, cacheKey] = args;
+      return await new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              sid: 'sid-base',
+              searchId: query.searchId,
+              refId: query.refId,
+              timestamp: Date.now(),
+              cacheKey,
+              executionMs: 10,
+            }),
+          10
+        )
+      );
+    });
+    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
+
+    await Promise.all([
+      datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api')),
+      datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker')),
     ]);
 
-    expect(doRequestSpy).toHaveBeenCalledTimes(2);
-    expect(doRequestSpy.mock.calls.map(([queryArg]) => queryArg.refId).sort()).toEqual(['A', 'B']);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
 
-    const firstValue = (firstResponse.data[0] as any).fields[0].values[0];
-    const secondValue = (secondResponse.data[0] as any).fields[0].values[0];
+  it('reruns a missing cached SID once before retrying the chain', async () => {
+    const datasource = createDataSource();
+    const executeSpy = jest.spyOn(datasource as any, 'executeBaseSearch').mockImplementation(async (...args: any[]) => {
+      const [query, _options, cacheKey] = args;
+      return {
+        sid: `sid-${executeSpy.mock.calls.length}`,
+        searchId: query.searchId,
+        refId: query.refId,
+        timestamp: Date.now(),
+        cacheKey,
+        executionMs: 1,
+      };
+    });
+    jest
+      .spyOn(datasource as any, 'searchJobExists')
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
-    expect(firstValue).toBe('A:index=alpha:0-60000');
-    expect(secondValue).toBe('B:index=beta:3000-4000');
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
+
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(chainSpy.mock.calls[1][2].sid).toBe('sid-2');
   });
 });
 
@@ -626,15 +945,7 @@ describe('DataSource.createDataFrame', () => {
         type: 'time',
       })
     );
-    expect(frame.fields[0].values).toEqual([
-      Date.parse('2024-01-01T00:00:00Z'),
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-    ]);
+    expect(frame.fields[0].values).toEqual([Date.parse('2024-01-01T00:00:00Z'), null, null, null, null, null, null]);
     expect(frame.fields[1]).toEqual(
       expect.objectContaining({
         name: 'count',

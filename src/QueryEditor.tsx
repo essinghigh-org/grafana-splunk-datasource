@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { css } from '@emotion/css';
 import { QueryEditorProps } from '@grafana/data';
-import { Badge, CodeEditor, Combobox, ComboboxOption, Field, Input, Tooltip } from '@grafana/ui';
+import { Badge, CodeEditor, Combobox, ComboboxOption, Field, Input, Switch, Tooltip } from '@grafana/ui';
 
 import { DataSource } from './datasource';
 import { defaultQuery, SplunkDataSourceOptions, SplunkQuery } from './types';
@@ -113,8 +113,9 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
   const { queryText = '', searchType = 'standard', searchId, baseSearchRefId } = query;
   const isChainSearch = searchType === 'chain';
   const isBaseSearch = searchType === 'base';
-  const currentSearchType = searchTypeOptions.find(option => option.value === searchType) ?? searchTypeOptions[0];
+  const currentSearchType = searchTypeOptions.find((option) => option.value === searchType) ?? searchTypeOptions[0];
   const editorHeight = getEditorHeight(queryText);
+  const useDashboardTimeRange = query.useDashboardTimeRange !== false;
 
   const onQueryTextChange = (value: string) => {
     onChange({ ...query, queryText: value });
@@ -161,12 +162,45 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
 
       {isBaseSearch && (
         <div className={styles.conditionalField}>
-          <Field label="Search ID" description="Identifier for this base search (used by chain searches)">
+          <Field
+            label="Search ID"
+            description="Identifier for this base search (used by chain searches)"
+          >
             <Input
               value={searchId ?? ''}
-              onChange={event => onChange({ ...query, searchId: event.currentTarget.value })}
+              onChange={(event) => onChange({ ...query, searchId: event.currentTarget.value })}
               placeholder="my-base-search"
               width={40}
+            />
+          </Field>
+          <Field label="Use dashboard time range">
+            <Switch
+              value={useDashboardTimeRange}
+              onChange={(event) => onChange({ ...query, useDashboardTimeRange: event.currentTarget.checked })}
+            />
+          </Field>
+          {!useDashboardTimeRange && (
+            <>
+              <Field label="Earliest">
+                <Input
+                  value={query.earliest ?? '-30d@d'}
+                  onChange={(event) => onChange({ ...query, earliest: event.currentTarget.value })}
+                  width={24}
+                />
+              </Field>
+              <Field label="Latest">
+                <Input
+                  value={query.latest ?? 'now'}
+                  onChange={(event) => onChange({ ...query, latest: event.currentTarget.value })}
+                  width={24}
+                />
+              </Field>
+            </>
+          )}
+          <Field label="Return base results" description="Normally off; chain searches only need the base SID.">
+            <Switch
+              value={query.returnBaseResults === true}
+              onChange={(event) => onChange({ ...query, returnBaseResults: event.currentTarget.checked })}
             />
           </Field>
         </div>
@@ -174,12 +208,18 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
 
       {isChainSearch && (
         <div className={styles.conditionalField}>
-          <Field label="Base Search Reference" description="RefId or search ID of the base search to build upon">
+          <Field
+            label="Base Search Reference"
+            description="Search ID of a base search on this dashboard"
+            invalid={!baseSearchRefId}
+            error={!baseSearchRefId ? 'Enter a base search ID.' : undefined}
+          >
             <Input
               value={baseSearchRefId ?? ''}
-              onChange={event => onChange({ ...query, baseSearchRefId: event.currentTarget.value })}
+              onChange={(event) => onChange({ ...query, baseSearchRefId: event.currentTarget.value })}
               placeholder="my-base-search"
               width={40}
+              invalid={!baseSearchRefId}
             />
           </Field>
         </div>
