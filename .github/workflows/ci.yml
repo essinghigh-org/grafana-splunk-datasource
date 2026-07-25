@@ -68,6 +68,14 @@ jobs:
         if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn test
 
+      - name: Upload plugin build
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist
+          retention-days: 1
+
   release:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.build.outputs.is_merge == 'true'
@@ -79,6 +87,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Download plugin build
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist
 
       - name: Create Release with Commit Hash
         env:
