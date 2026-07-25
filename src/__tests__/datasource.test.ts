@@ -302,7 +302,7 @@ describe('DataSource runtime pagination', () => {
 
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
 
-    const result = await datasource.doGetAllResultsRequest('sid-pagination');
+    const result = await datasource.client.doGetAllResultsRequest('sid-pagination');
 
     expect(fetchMock.mock.calls.map(([request]) => request.params.offset)).toEqual([0, 2, 4]);
     expect(result.fields).toEqual(['_time', 'host']);
@@ -326,7 +326,7 @@ describe('DataSource runtime pagination', () => {
     );
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
 
-    const result = await datasource.doGetAllResultsRequest('sid-limited');
+    const result = await datasource.client.doGetAllResultsRequest('sid-limited');
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.results).toHaveLength(3);
@@ -342,7 +342,7 @@ describe('DataSource runtime polling', () => {
   it('times out waiting for search completion using bounded polling', async () => {
     const datasource = createDataSource();
     const statusSpy = jest
-      .spyOn(datasource, 'doSearchStatusRequest')
+      .spyOn(datasource.client, 'doSearchStatusRequest')
       .mockResolvedValue({ state: 'RUNNING', messages: [] });
 
     const completed = await (datasource as any).waitForSearchCompletion('sid-timeout', 1, 5);
@@ -353,12 +353,12 @@ describe('DataSource runtime polling', () => {
 
   it('uses bounded polling helper in standard request flow', async () => {
     const datasource = createDataSource();
-    jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-standard' });
+    jest.spyOn(datasource.client, 'doSearchRequest').mockResolvedValue({ sid: 'sid-standard' });
     const waitSpy = jest
       .spyOn(datasource as any, 'waitForSearchCompletion')
       .mockResolvedValue({ state: 'RUNNING', messages: [] });
-    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
-    const cancelSpy = jest.spyOn(datasource as any, 'cancelSearchJob').mockResolvedValue(undefined);
+    const getAllSpy = jest.spyOn(datasource.client, 'doGetAllResultsRequest');
+    const cancelSpy = jest.spyOn(datasource.client as any, 'cancelSearchJob').mockResolvedValue(undefined);
 
     await expect(
       datasource.doRequest(
@@ -379,12 +379,12 @@ describe('DataSource runtime polling', () => {
 
   it('surfaces Splunk failure messages instead of fetching results', async () => {
     const datasource = createDataSource();
-    jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-failed' });
+    jest.spyOn(datasource.client, 'doSearchRequest').mockResolvedValue({ sid: 'sid-failed' });
     jest
       .spyOn(datasource as any, 'waitForSearchCompletion')
       .mockResolvedValue({ state: 'FAILED', messages: ['Invalid search command'] });
-    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
-    jest.spyOn(datasource as any, 'cancelSearchJob').mockResolvedValue(undefined);
+    const getAllSpy = jest.spyOn(datasource.client, 'doGetAllResultsRequest');
+    jest.spyOn(datasource.client as any, 'cancelSearchJob').mockResolvedValue(undefined);
 
     await expect(
       datasource.doRequest(
@@ -401,7 +401,7 @@ describe('DataSource runtime polling', () => {
     const fetchMock = jest.fn().mockReturnValue(of({ data: { sid: 'sid-base' } }));
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
 
-    await datasource.doSearchRequest(
+    await datasource.client.doSearchRequest(
       {
         refId: 'A',
         queryText: 'index=_internal',
@@ -425,7 +425,7 @@ describe('DataSource runtime polling', () => {
     const waitSpy = jest
       .spyOn(datasource as any, 'waitForSearchCompletion')
       .mockResolvedValue({ state: 'RUNNING', messages: [] });
-    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+    const getAllSpy = jest.spyOn(datasource.client, 'doGetAllResultsRequest');
 
     const baseSearch = {
       sid: 'sid-base',
@@ -483,7 +483,7 @@ describe('DataSource runtime polling', () => {
     const fetchMock = jest.fn().mockReturnValue(of({ data: {} }));
     mockedGetBackendSrv.mockReturnValue({ fetch: fetchMock });
     const waitSpy = jest.spyOn(datasource as any, 'waitForSearchCompletion');
-    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+    const getAllSpy = jest.spyOn(datasource.client, 'doGetAllResultsRequest');
 
     const baseSearch = {
       sid: 'sid-base',
@@ -538,7 +538,7 @@ describe('DataSource query orchestration', () => {
         executionMs: 1,
       };
     });
-    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource.client as any, 'searchJobExists').mockResolvedValue(true);
     const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockImplementation(async () => {
       calls.push('chain:C');
       return { fields: ['value'], results: [{ value: 'C-value' }] };
@@ -577,9 +577,9 @@ describe('DataSource query orchestration', () => {
 
   it('does not download hidden base results and exposes base metadata', async () => {
     const datasource = createDataSource();
-    jest.spyOn(datasource, 'doSearchRequest').mockResolvedValue({ sid: 'sid-base' });
+    jest.spyOn(datasource.client, 'doSearchRequest').mockResolvedValue({ sid: 'sid-base' });
     jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue({ state: 'DONE', messages: [] });
-    const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
+    const getAllSpy = jest.spyOn(datasource.client, 'doGetAllResultsRequest');
 
     const response = await datasource.query(
       createQueryRequest([
@@ -618,7 +618,7 @@ describe('DataSource query orchestration', () => {
           )
         )
     );
-    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource.client as any, 'searchJobExists').mockResolvedValue(true);
     const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
     await Promise.all([
@@ -790,7 +790,7 @@ describe('DataSource base-search cache behavior', () => {
         executionMs: 1,
       };
     });
-    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource.client as any, 'searchJobExists').mockResolvedValue(true);
     jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
     return executeSpy;
   };
@@ -878,7 +878,7 @@ describe('DataSource base-search cache behavior', () => {
         )
       );
     });
-    jest.spyOn(datasource as any, 'searchJobExists').mockResolvedValue(true);
+    jest.spyOn(datasource.client as any, 'searchJobExists').mockResolvedValue(true);
     jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
     await Promise.all([
@@ -903,9 +903,9 @@ describe('DataSource base-search cache behavior', () => {
       };
     });
     jest
-      .spyOn(datasource as any, 'searchJobExists')
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(false);
+      .spyOn(datasource.client as any, 'doSearchStatusRequest')
+      .mockResolvedValueOnce({ state: 'DONE', messages: [] })
+      .mockResolvedValueOnce({ state: 'FAILED', messages: [] });
     const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
     await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));

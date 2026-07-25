@@ -1,6 +1,5 @@
 name: CI
 
-
 on:
   push:
     branches:
@@ -19,66 +18,44 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      is_merge: ${{ steps.check_merge.outputs.is_merge }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check if merge commit (early exit for non-merge pushes to main)
-        id: check_merge
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          # Check if this is a merge commit (has more than one parent) OR commit message indicates a PR merge
-          if [ $(git rev-list --count --merges HEAD^..HEAD) -gt 0 ] || git log -1 --pretty=%B | grep -qE "(Merge pull request|Merge branch|\(#[0-9]+\))" ; then
-            echo "is_merge=true" >> $GITHUB_OUTPUT
-            echo "✅ This is a merge commit, continuing with build and release"
-          else
-            echo "is_merge=false" >> $GITHUB_OUTPUT
-            echo "❌ This is not a merge commit, skipping build and release"
-            exit 0
-          fi
-
       - name: Set up Node.js
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         uses: actions/setup-node@v4
         with:
           node-version: '20.x'
           cache: 'yarn'
 
       - name: Install dependencies
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn install --frozen-lockfile
 
       - name: Lint
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn lint
 
       - name: Typecheck
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn typecheck
 
       - name: Build plugin
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
         run: yarn build
 
       - name: Run tests
-        if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true')
-        run: yarn test
+        run: yarn test:ci
 
       - name: Upload plugin build
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.check_merge.outputs.is_merge == 'true'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: plugin-dist
           path: dist
-          retention-days: 1
+          retention-days: 7
 
   release:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.build.outputs.is_merge == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write

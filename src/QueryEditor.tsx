@@ -1,11 +1,12 @@
 import React, { useMemo } from 'react';
 import { css } from '@emotion/css';
 import { QueryEditorProps } from '@grafana/data';
-import { Badge, CodeEditor, Combobox, ComboboxOption, Field, Input, Switch, Tooltip } from '@grafana/ui';
+import { Badge, CodeEditor, Combobox, ComboboxOption, Field, Tooltip } from '@grafana/ui';
 
 import { DataSource } from './datasource';
 import { defaultQuery, SplunkDataSourceOptions, SplunkQuery } from './types';
 import { registerSplunkLanguage, SPL_LANGUAGE_ID } from './language/splMonaco';
+import { QueryEditorConfig } from './components/QueryEditorConfig';
 
 type Props = QueryEditorProps<DataSource, SplunkQuery, SplunkDataSourceOptions>;
 type SearchType = NonNullable<SplunkQuery['searchType']>;
@@ -160,70 +161,7 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
         </div>
       </div>
 
-      {isBaseSearch && (
-        <div className={styles.conditionalField}>
-          <Field
-            label="Search ID"
-            description="Identifier for this base search (used by chain searches)"
-          >
-            <Input
-              value={searchId ?? ''}
-              onChange={(event) => onChange({ ...query, searchId: event.currentTarget.value })}
-              placeholder="my-base-search"
-              width={40}
-            />
-          </Field>
-          <Field label="Use dashboard time range">
-            <Switch
-              value={useDashboardTimeRange}
-              onChange={(event) => onChange({ ...query, useDashboardTimeRange: event.currentTarget.checked })}
-            />
-          </Field>
-          {!useDashboardTimeRange && (
-            <>
-              <Field label="Earliest">
-                <Input
-                  value={query.earliest ?? '-30d@d'}
-                  onChange={(event) => onChange({ ...query, earliest: event.currentTarget.value })}
-                  width={24}
-                />
-              </Field>
-              <Field label="Latest">
-                <Input
-                  value={query.latest ?? 'now'}
-                  onChange={(event) => onChange({ ...query, latest: event.currentTarget.value })}
-                  width={24}
-                />
-              </Field>
-            </>
-          )}
-          <Field label="Return base results" description="Normally off; chain searches only need the base SID.">
-            <Switch
-              value={query.returnBaseResults === true}
-              onChange={(event) => onChange({ ...query, returnBaseResults: event.currentTarget.checked })}
-            />
-          </Field>
-        </div>
-      )}
-
-      {isChainSearch && (
-        <div className={styles.conditionalField}>
-          <Field
-            label="Base Search Reference"
-            description="Search ID of a base search on this dashboard"
-            invalid={!baseSearchRefId}
-            error={!baseSearchRefId ? 'Enter a base search ID.' : undefined}
-          >
-            <Input
-              value={baseSearchRefId ?? ''}
-              onChange={(event) => onChange({ ...query, baseSearchRefId: event.currentTarget.value })}
-              placeholder="my-base-search"
-              width={40}
-              invalid={!baseSearchRefId}
-            />
-          </Field>
-        </div>
-      )}
+      <QueryEditorConfig query={query} onChange={onChange} styles={styles} />
 
       <div className={styles.queryContainer}>
         <Field

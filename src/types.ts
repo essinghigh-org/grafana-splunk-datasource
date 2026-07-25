@@ -69,3 +69,5 @@ export interface SplunkDataSourceOptions extends DataSourceJsonData {
 export interface SplunkSecureJsonData {
   basicAuthToken?: string;
 }
+
+export type EffectiveSearchType = NonNullable<SplunkQuery['searchType']>;
