@@ -1,11 +1,10 @@
-import { getBackendSrv, getTemplateSrv } from '@grafana/runtime';
+import { DataSourceWithBackend, getBackendSrv, getTemplateSrv } from '@grafana/runtime';
 import { from, lastValueFrom } from 'rxjs';
 
 import {
   CustomVariableSupport,
   DataQueryRequest,
   DataQueryResponse,
-  DataSourceApi,
   DataSourceInstanceSettings,
   MetricFindValue,
   PartialDataFrame,
@@ -186,7 +185,7 @@ function generateCacheKey(query: SplunkQuery, options: DataQueryRequest<SplunkQu
   return [getDashboardNamespace(options), query.searchId || query.refId || '', expandedQuery, ...timeRange].join('|');
 }
 
-export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptions> {
+export class DataSource extends DataSourceWithBackend<SplunkQuery, SplunkDataSourceOptions> {
   url?: string;
   variables = new SplunkCustomVariableSupport(this);
   private readonly baseSearchCache: Map<string, BaseSearchResult> = new Map();
@@ -331,7 +330,12 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     return safeOptions as DataQueryRequest<SplunkQuery>;
   }
 
-  async query(options: DataQueryRequest<SplunkQuery>): Promise<DataQueryResponse> {
+  /**
+   * Dashboard and alert queries use DataSourceWithBackend.query(), which posts
+   * the request to Grafana's /api/ds/query endpoint. Keep the old execution
+   * path available for metric variables and compatibility tests.
+   */
+  async queryFrontend(options: DataQueryRequest<SplunkQuery>): Promise<DataQueryResponse> {
     this.validateTargets(options.targets);
     this.cleanupStaleCache();
 
@@ -367,6 +371,13 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
     });
 
     return { data: resultFrames.filter((frame): frame is PartialDataFrame => Boolean(frame)) };
+  }
+
+  applyTemplateVariables(query: SplunkQuery, scopedVars: DataQueryRequest<SplunkQuery>['scopedVars']): SplunkQuery {
+    return {
+      ...query,
+      queryText: getTemplateSrv().replace(query.queryText || '', scopedVars),
+    };
   }
 
   private resolveQuerySearchType(query: SplunkQuery): EffectiveSearchType {
@@ -797,38 +808,6 @@ export class DataSource extends DataSourceApi<SplunkQuery, SplunkDataSourceOptio
       this.debug('cancelled Splunk job', { sid });
     } catch {
       this.debug('failed to cancel Splunk job', { sid });
-    }
-  }
-
-  async testDatasource() {
-    const data = new URLSearchParams({
-      search: `search index=_internal * | stats count`,
-      output_mode: 'json',
-      exec_mode: 'oneshot',
-    }).toString();
-
-    try {
-      await lastValueFrom(
-        getBackendSrv().fetch<any>({
-          method: 'POST',
-          url: this.url + '/services/search/jobs',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          data: data,
-        }) as any
-      );
-      return {
-        status: 'success',
-        message: 'Data source is working',
-        title: 'Success',
-      };
-    } catch (err: any) {
-      return {
-        status: 'error',
-        message: err.statusText,
-        title: 'Error',
-      };
     }
   }
 

@@ -3,6 +3,7 @@
 coverage/
 dist/
 node_modules/
+go_plugin_build_manifest
 *~
 \#*
 .\#*

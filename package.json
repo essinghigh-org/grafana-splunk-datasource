@@ -3,7 +3,9 @@
   "version": "0.2.0",
   "description": "",
   "scripts": {
-    "build": "webpack -c ./webpack.config.ts --env production",
+    "build": "yarn build:frontend && yarn build:backend",
+    "build:frontend": "webpack -c ./webpack.config.ts --env production",
+    "build:backend": "./scripts/build-backend.sh",
     "dev": "webpack -w -c ./webpack.config.ts --env development",
     "lint": "eslint --cache --ignore-path ./.gitignore --ext .js,.jsx,.ts,.tsx .",
     "lint:fix": "yarn run lint --fix && prettier --write --list-different .",

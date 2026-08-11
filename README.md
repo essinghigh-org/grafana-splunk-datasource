@@ -50,9 +50,12 @@ by an administrator from Grafana's UI `Configuration --> Datasources --> Add dat
 
 - Use `yarn start` (or `yarn watch`) for local frontend watch builds.
 - Use `yarn server` to launch the local Grafana environment (defaults to `GRAFANA_VERSION=12.0.0`, configurable via env var).
+- The datasource includes a Go backend. Install Go 1.21 or newer before running a complete build; `yarn build` emits the frontend bundle and the platform-specific backend executable consumed by Grafana.
+- Dashboard, Explore, and alert queries are handled by the backend through Grafana's `/api/ds/query` endpoint. Variable queries continue to use the datasource's variable-query support.
 - Before opening a PR, run the same checks gated in CI:
 
 ```bash
+go test ./pkg/...
 yarn lint
 yarn typecheck
 yarn test

@@ -3,6 +3,8 @@
   "type": "datasource",
   "name": "splunk-datasource",
   "id": "essinghigh-splunk-datasource",
+  "backend": true,
+  "executable": "essinghigh-splunk-datasource",
   "metrics": true,
   "info": {
     "description": "",

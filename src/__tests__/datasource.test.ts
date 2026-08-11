@@ -1,6 +1,7 @@
 import type { DataSourceInstanceSettings } from '@grafana/data';
 import { getBackendSrv } from '@grafana/runtime';
-import { of } from 'rxjs';
+import { from, lastValueFrom, of } from 'rxjs';
+import { map } from 'rxjs/operators';
 
 import { DataSource } from '../datasource';
 import { QueryRequestResults, SplunkDataSourceOptions } from '../types';
@@ -51,6 +52,52 @@ jest.mock('@grafana/data', () => {
 });
 
 jest.mock('@grafana/runtime', () => ({
+  DataSourceWithBackend: class {
+    id?: number;
+    uid: string;
+    type: string;
+
+    constructor(instanceSettings: any) {
+      this.id = instanceSettings.id;
+      this.uid = instanceSettings.uid;
+      this.type = instanceSettings.type;
+    }
+
+    query(request: any) {
+      const queries = request.targets.map((query: any) => ({
+        ...((this as any).applyTemplateVariables?.(query, request.scopedVars) ?? query),
+        datasource: {
+          type: this.type,
+          uid: this.uid,
+        },
+        datasourceId: this.id,
+        intervalMs: request.intervalMs,
+        maxDataPoints: request.maxDataPoints,
+      }));
+
+      return getBackendSrv()
+        .fetch({
+          url: `/api/ds/query?ds_type=${this.type}&requestId=${encodeURIComponent(request.requestId)}`,
+          method: 'POST',
+          data: {
+            queries,
+            from: request.range.from.valueOf().toString(),
+            to: request.range.to.valueOf().toString(),
+          },
+          requestId: request.requestId,
+          headers: {
+            ...(request.headers ?? {}),
+            'X-Plugin-Id': this.type,
+            'X-Datasource-Uid': this.uid,
+          },
+        })
+        .pipe(
+          map((response: any) => ({
+            data: request.targets.flatMap((query: any) => response.data.results?.[query.refId]?.frames ?? []),
+          }))
+        );
+    }
+  },
   getBackendSrv: jest.fn(),
   getTemplateSrv: jest.fn(() => ({
     replace: (value: string, scopedVars: Record<string, { value?: unknown }> = {}) =>
@@ -97,6 +144,103 @@ const createQueryRequest = (targets: any[] = []) =>
   }) as any;
 
 const mockedGetBackendSrv = getBackendSrv as unknown as jest.Mock;
+
+const createBackendQueryFixture = (datasource: DataSource, request: any) => {
+  const requests: any[] = [];
+  const fetch = jest.fn().mockImplementation((backendRequest: any) => {
+    requests.push(backendRequest);
+
+    const forwardedRequest = {
+      ...request,
+      targets: backendRequest.data.queries.map((query: any) => {
+        const {
+          datasource: _datasource,
+          datasourceId: _datasourceId,
+          intervalMs: _intervalMs,
+          maxDataPoints: _maxDataPoints,
+          ...originalQuery
+        } = query;
+        return originalQuery;
+      }),
+    };
+
+    return from(datasource.queryFrontend(forwardedRequest)).pipe(
+      map((response) => ({
+        data: {
+          results: Object.fromEntries(
+            response.data.map((frame: any) => [frame.refId, { frames: [frame] }])
+          ),
+        },
+      }))
+    );
+  });
+
+  return { fetch, requests };
+};
+
+describe('DataSource backend query boundary', () => {
+  beforeEach(() => {
+    mockedGetBackendSrv.mockReset();
+  });
+
+  it.each([
+    ['dashboard', 'dashboard'],
+    ['Explore', 'explore'],
+    ['alert', 'alerting'],
+  ])('executes %s requests through the backend query path', async (_label, app) => {
+    const datasource = createDataSource();
+    const request = createQueryRequest([
+      {
+        refId: 'A',
+        queryText: 'index=_internal | head 1',
+        searchType: 'standard',
+      },
+    ]);
+    request.app = app;
+
+    const doRequestSpy = jest.spyOn(datasource, 'doRequest').mockResolvedValue({
+      fields: ['value'],
+      results: [{ value: 'backend-value' }],
+    } as QueryRequestResults);
+    const backendFixture = createBackendQueryFixture(datasource, request);
+    mockedGetBackendSrv.mockReturnValue({ fetch: backendFixture.fetch });
+
+    const response = await lastValueFrom(datasource.query(request));
+
+    expect(backendFixture.requests).toHaveLength(1);
+    expect(backendFixture.requests[0]).toMatchObject({
+      url: '/api/ds/query?ds_type=essinghigh-splunk-datasource&requestId=runtime-test',
+      method: 'POST',
+      requestId: 'runtime-test',
+      headers: {
+        'X-Plugin-Id': 'essinghigh-splunk-datasource',
+        'X-Datasource-Uid': 'splunk-test',
+      },
+      data: {
+        from: '0',
+        to: '60000',
+        queries: [
+          expect.objectContaining({
+            refId: 'A',
+            queryText: 'index=_internal | head 1',
+            datasource: {
+              type: 'essinghigh-splunk-datasource',
+              uid: 'splunk-test',
+            },
+            datasourceId: 1,
+            intervalMs: 60_000,
+            maxDataPoints: 1000,
+          }),
+        ],
+      },
+    });
+    expect(doRequestSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ refId: 'A' }),
+      expect.objectContaining({ app })
+    );
+    expect(response.data).toEqual([expect.objectContaining({ refId: 'A' })]);
+  });
+});
 
 describe('DataSource.metricFindQuery', () => {
   it('exposes CustomVariableSupport from datasource.variables', () => {
@@ -544,7 +688,7 @@ describe('DataSource query orchestration', () => {
       return { fields: ['value'], results: [{ value: 'C-value' }] };
     });
 
-    const response = await datasource.query(
+    const response = await datasource.queryFrontend(
       createQueryRequest([
         {
           refId: 'C',
@@ -581,7 +725,7 @@ describe('DataSource query orchestration', () => {
     jest.spyOn(datasource as any, 'waitForSearchCompletion').mockResolvedValue({ state: 'DONE', messages: [] });
     const getAllSpy = jest.spyOn(datasource, 'doGetAllResultsRequest');
 
-    const response = await datasource.query(
+    const response = await datasource.queryFrontend(
       createQueryRequest([
         {
           refId: 'A',
@@ -622,12 +766,12 @@ describe('DataSource query orchestration', () => {
     const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
     await Promise.all([
-      datasource.query(
+      datasource.queryFrontend(
         createQueryRequest([
           { refId: 'A', queryText: 'index=servicenow', searchType: 'base', searchId: 'snow-base' },
         ])
       ),
-      datasource.query(
+      datasource.queryFrontend(
         createQueryRequest([
           {
             refId: 'A',
@@ -674,10 +818,10 @@ describe('DataSource base-search state isolation', () => {
       searchId: 'shared-base',
     } as any;
 
-    const queryAPromise = datasourceA.query(createQueryRequest([baseTarget]));
+    const queryAPromise = datasourceA.queryFrontend(createQueryRequest([baseTarget]));
     await Promise.resolve();
 
-    const queryBPromise = datasourceB.query(createQueryRequest([baseTarget]));
+    const queryBPromise = datasourceB.queryFrontend(createQueryRequest([baseTarget]));
     await Promise.resolve();
 
     expect(executeBSpy).toHaveBeenCalledTimes(1);
@@ -746,7 +890,7 @@ describe('DataSource base-search state isolation', () => {
       },
     };
 
-    await Promise.all([datasource.query(firstRequest), datasource.query(secondRequest)]);
+    await Promise.all([datasource.queryFrontend(firstRequest), datasource.queryFrontend(secondRequest)]);
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
     expect(executeSpy.mock.calls.map(([queryArg]: any[]) => queryArg.refId).sort()).toEqual(['A', 'B']);
@@ -799,8 +943,8 @@ describe('DataSource base-search cache behavior', () => {
     const datasource = createDataSource();
     const executeSpy = mockBaseAndChain(datasource);
 
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
 
     expect(executeSpy).toHaveBeenCalledTimes(1);
   });
@@ -809,8 +953,8 @@ describe('DataSource base-search cache behavior', () => {
     const datasource = createDataSource();
     const executeSpy = mockBaseAndChain(datasource);
 
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-2', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-2', 'api'));
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
   });
@@ -826,8 +970,8 @@ describe('DataSource base-search cache behavior', () => {
       raw: { from: 'now-10m', to: 'now-5m' },
     };
 
-    await datasource.query(first);
-    await datasource.query(second);
+    await datasource.queryFrontend(first);
+    await datasource.queryFrontend(second);
 
     expect(executeSpy).toHaveBeenCalledTimes(1);
   });
@@ -840,8 +984,8 @@ describe('DataSource base-search cache behavior', () => {
     first.dashboardUID = 'dashboard-a';
     second.dashboardUID = 'dashboard-b';
 
-    await datasource.query(first);
-    await datasource.query(second);
+    await datasource.queryFrontend(first);
+    await datasource.queryFrontend(second);
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
   });
@@ -851,9 +995,9 @@ describe('DataSource base-search cache behavior', () => {
     const executeSpy = mockBaseAndChain(datasource);
     const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
 
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
     nowSpy.mockReturnValue(1_007_000);
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
     nowSpy.mockRestore();
@@ -882,8 +1026,8 @@ describe('DataSource base-search cache behavior', () => {
     jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
     await Promise.all([
-      datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api')),
-      datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker')),
+      datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api')),
+      datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker')),
     ]);
 
     expect(executeSpy).toHaveBeenCalledTimes(1);
@@ -908,8 +1052,8 @@ describe('DataSource base-search cache behavior', () => {
       .mockResolvedValueOnce(false);
     const chainSpy = jest.spyOn(datasource, 'doChainRequest').mockResolvedValue({ fields: [], results: [] });
 
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
-    await datasource.query(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'api'));
+    await datasource.queryFrontend(setVariables(createQueryRequest([baseTarget, chainTarget]), 'web-1', 'worker'));
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
     expect(chainSpy.mock.calls[1][2].sid).toBe('sid-2');
