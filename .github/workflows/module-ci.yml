@@ -1,0 +1,18 @@
+name: module-ci
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: opentofu/setup-opentofu@v1
+      - run: tofu fmt -check -recursive
+      - run: tofu init -backend=false -input=false
+      - run: tofu validate
+      - uses: terraform-linters/setup-tflint@v6
+      - run: tflint --init
+      - run: tflint
