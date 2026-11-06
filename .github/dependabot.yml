@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+        patterns:
+          - '*'
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+        patterns:
+          - '*'
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - '*'
