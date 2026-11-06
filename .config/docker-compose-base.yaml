@@ -7,11 +7,11 @@ services:
       context: .
       args:
         grafana_image: ${GRAFANA_IMAGE:-grafana-enterprise}
-        grafana_version: ${GRAFANA_VERSION:-13.0.1}
+        grafana_version: ${GRAFANA_VERSION:-13.3.0}
         development: ${DEVELOPMENT:-false}
         anonymous_auth_enabled: ${ANONYMOUS_AUTH_ENABLED:-true}
     ports:
-      - 3000:3000/tcp
+      - 127.0.0.1:3000:3000/tcp
     volumes:
       - ../dist:/var/lib/grafana/plugins/essinghigh-splunk-datasource
       - ../provisioning:/etc/grafana/provisioning

@@ -1,26 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Get the short commit hash and commit message
-COMMIT_HASH=$(git rev-parse --short HEAD)
-COMMIT_MESSAGE=$(git log -1 --pretty=%B)
-DATE=$(date '+%Y-%m-%d')
+set -euo pipefail
 
-# Create changelog entry
-CHANGELOG_ENTRY="## $COMMIT_HASH ($DATE)
+commit_hash=$(git rev-parse --short HEAD)
+commit_message=$(git log -1 --pretty=%B)
+release_date=$(date -u '+%Y-%m-%d')
 
-$COMMIT_MESSAGE
-
-"
-
-# Check if CHANGELOG.md exists
-if [ ! -f "CHANGELOG.md" ]; then
-    echo "# Changelog" > CHANGELOG.md
-    echo "" >> CHANGELOG.md
+if [ -f CHANGELOG.md ] && grep -q "^## $commit_hash (" CHANGELOG.md; then
+  exit 0
 fi
 
-# Create a temporary file with the new entry at the top
-echo "$CHANGELOG_ENTRY" > temp_changelog.md
-cat CHANGELOG.md >> temp_changelog.md
-mv temp_changelog.md CHANGELOG.md
-
-echo "Updated CHANGELOG.md with entry for $COMMIT_HASH"
+changelog_tmp=$(mktemp ./CHANGELOG.md.XXXXXX)
+trap 'rm -f "$changelog_tmp"' EXIT
+{
+  printf '## %s (%s)\n\n%s\n\n' "$commit_hash" "$release_date" "$commit_message"
+  if [ -f CHANGELOG.md ]; then
+    cat CHANGELOG.md
+  else
+    printf '# Changelog\n'
+  fi
+} > "$changelog_tmp"
+chmod 0644 "$changelog_tmp"
+mv "$changelog_tmp" CHANGELOG.md
+printf 'Updated changelog with entry for %s.\n' "$commit_hash"

@@ -1,11 +1,11 @@
 .PHONY: all build build-splunk-datasource
 
-SHELL = BASH_ENV=.rc /bin/bash --noprofile
+SHELL = /bin/sh
 
 all: build
 
 build: build-splunk-datasource
 
 build-splunk-datasource:
-	yarn install
+	yarn install --immutable
 	yarn build

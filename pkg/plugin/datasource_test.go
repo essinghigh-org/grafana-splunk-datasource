@@ -25,7 +25,7 @@ func testDatasource(server *httptest.Server) *Datasource {
 		maxRows:  100,
 		maxPages: 10,
 		maxBytes: 1024 * 1024,
-		cache:    make(map[string]cachedSearch),
+		cache:    make(map[searchCacheKey]cachedSearch),
 	}
 }
 
