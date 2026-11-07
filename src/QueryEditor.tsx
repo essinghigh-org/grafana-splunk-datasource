@@ -1,18 +1,27 @@
 import React, { useMemo } from 'react';
 import { css } from '@emotion/css';
-import { QueryEditorProps } from '@grafana/data';
-import { Badge, CodeEditor, Combobox, ComboboxOption, Field, Input, Switch, Tooltip } from '@grafana/ui';
+import type { GrafanaTheme2, QueryEditorProps } from '@grafana/data';
+import {
+  Badge,
+  CodeEditor,
+  Combobox,
+  type ComboboxOption,
+  Field,
+  Input,
+  Switch,
+  Tooltip,
+  useStyles2,
+  useTheme2,
+} from '@grafana/ui';
 
-import { DataSource } from './datasource';
-import { defaultQuery, SplunkDataSourceOptions, SplunkQuery } from './types';
+import type { DataSource } from './datasource';
+import { defaultQuery, type SplunkDataSourceOptions, type SplunkQuery } from './types';
 import { registerSplunkLanguage, SPL_LANGUAGE_ID } from './language/splMonaco';
 
 type Props = QueryEditorProps<DataSource, SplunkQuery, SplunkDataSourceOptions>;
 type SearchType = NonNullable<SplunkQuery['searchType']>;
 
 const MIN_LINES = 8;
-const LINE_HEIGHT = 18;
-const EDITOR_VERTICAL_PADDING = 8;
 
 const searchTypeOptions: Array<ComboboxOption<SearchType>> = [
   {
@@ -35,72 +44,63 @@ const searchTypeOptions: Array<ComboboxOption<SearchType>> = [
   },
 ];
 
-const styles = {
+const getStyles = (theme: GrafanaTheme2) => ({
   container: css`
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    margin-left: -24px;
+    gap: ${theme.spacing(2)};
   `,
   headerRow: css`
     display: flex;
     align-items: center;
-    gap: 12px;
-    margin-bottom: 8px;
+    gap: ${theme.spacing(1.5)};
+    margin-bottom: ${theme.spacing(1)};
   `,
   searchTypeContainer: css`
     display: flex;
     align-items: center;
-    gap: 8px;
-  `,
-  badge: css`
-    font-size: 11px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    gap: ${theme.spacing(1)};
   `,
   queryContainer: css`
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: ${theme.spacing(1)};
+  `,
+  queryLabel: css`
+    display: flex;
+    align-items: center;
+    gap: ${theme.spacing(1)};
   `,
   conditionalField: css`
-    background: rgba(204, 204, 220, 0.07);
-    border: 1px solid rgba(204, 204, 220, 0.15);
-    border-radius: 4px;
-    padding: 12px;
-    margin-bottom: 8px;
+    background: ${theme.colors.background.secondary};
+    border: 1px solid ${theme.colors.border.weak};
+    border-radius: ${theme.shape.radius.default};
+    padding: ${theme.spacing(1.5)};
+    margin-bottom: ${theme.spacing(1)};
   `,
   queryField: css`
     width: 100%;
-    border: 1px solid rgba(204, 204, 220, 0.25);
-    border-radius: 6px;
+    border: 1px solid ${theme.colors.border.medium};
+    border-radius: ${theme.shape.radius.default};
     overflow: hidden;
     position: relative;
-
-    .monaco-editor .scroll-decoration {
-      box-shadow: none !important;
-    }
   `,
   placeholder: css`
     position: absolute;
-    top: 5px;
-    left: 45px;
-    color: rgba(255, 255, 255, 0.4);
-    font-family: Monaco, Menlo, 'Ubuntu Mono', monospace;
-    font-size: 13px;
-    line-height: 18px;
+    top: ${theme.spacing(0.5)};
+    left: ${theme.spacing(5.5)};
+    color: ${theme.colors.text.secondary};
+    font-family: ${theme.typography.fontFamilyMonospace};
+    font-size: ${theme.typography.pxToRem(theme.typography.fontSize)};
+    line-height: ${theme.typography.code.lineHeight};
     pointer-events: none;
     z-index: 1;
   `,
-};
+});
 
-const getEditorHeight = (queryText: string) => {
-  const lineCount = queryText.length > 0 ? queryText.split('\n').length : 1;
-  return Math.max(lineCount, MIN_LINES) * LINE_HEIGHT + EDITOR_VERTICAL_PADDING;
-};
-
-export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
+export const QueryEditor = ({ onChange, onRunQuery, query: rawQuery }: Props) => {
+  const theme = useTheme2();
+  const styles = useStyles2(getStyles);
   const query = useMemo(
     () =>
       ({
@@ -114,7 +114,9 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
   const isChainSearch = searchType === 'chain';
   const isBaseSearch = searchType === 'base';
   const currentSearchType = searchTypeOptions.find((option) => option.value === searchType) ?? searchTypeOptions[0];
-  const editorHeight = getEditorHeight(queryText);
+  const lineHeight = Math.round(theme.typography.fontSize * theme.typography.code.lineHeight);
+  const lineCount = Math.max(queryText.split('\n').length, MIN_LINES);
+  const editorHeight = `calc(${lineCount * lineHeight}px + ${theme.spacing(1)})`;
   const useDashboardTimeRange = query.useDashboardTimeRange !== false;
 
   const onQueryTextChange = (value: string) => {
@@ -147,15 +149,17 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
     <div className={styles.container}>
       <div className={styles.headerRow}>
         <div className={styles.searchTypeContainer}>
-          <Combobox<SearchType>
-            options={searchTypeOptions}
-            value={currentSearchType.value}
-            onChange={onSearchTypeChange}
-            width={24}
-            placeholder="Search type"
-          />
+          <Field label="Search type" noMargin>
+            <Combobox<SearchType>
+              options={searchTypeOptions}
+              value={currentSearchType.value}
+              onChange={onSearchTypeChange}
+              width={24}
+              placeholder="Search type"
+            />
+          </Field>
           <Tooltip content={currentSearchType.description ?? 'Select search type'}>
-            <Badge text={currentSearchType.label ?? 'Standard'} color="blue" className={styles.badge} />
+            <Badge text={currentSearchType.label ?? 'Standard'} color="blue" />
           </Tooltip>
         </div>
       </div>
@@ -211,15 +215,15 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
           <Field
             label="Base Search Reference"
             description="Search ID of a base search on this dashboard"
-            invalid={!baseSearchRefId}
-            error={!baseSearchRefId ? 'Enter a base search ID.' : undefined}
+            invalid={!baseSearchRefId?.trim()}
+            error={!baseSearchRefId?.trim() ? 'Enter a base search ID.' : undefined}
           >
             <Input
               value={baseSearchRefId ?? ''}
               onChange={(event) => onChange({ ...query, baseSearchRefId: event.currentTarget.value })}
               placeholder="my-base-search"
               width={40}
-              invalid={!baseSearchRefId}
+              invalid={!baseSearchRefId?.trim()}
             />
           </Field>
         </div>
@@ -228,10 +232,10 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
       <div className={styles.queryContainer}>
         <Field
           label={
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div className={styles.queryLabel}>
               <span>Splunk Query</span>
-              {isChainSearch && <Badge text="Chain" color="orange" className={styles.badge} />}
-              {isBaseSearch && <Badge text="Base" color="green" className={styles.badge} />}
+              {isChainSearch && <Badge text="Chain" color="orange" />}
+              {isBaseSearch && <Badge text="Base" color="green" />}
             </div>
           }
           description={
@@ -244,7 +248,7 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
         >
           <div className={styles.queryField}>
             {queryText.trim() === '' && (
-              <div className={styles.placeholder}>
+              <div className={styles.placeholder} aria-hidden="true">
                 {isChainSearch ? '| stats count by host | head 10' : 'index=main sourcetype=access_* | head 100'}
               </div>
             )}
@@ -253,12 +257,14 @@ export const QueryEditor = ({ onChange, query: rawQuery }: Props) => {
               language={SPL_LANGUAGE_ID}
               height={editorHeight}
               onChange={onQueryTextChange}
+              onSave={onRunQuery}
               showLineNumbers
               showMiniMap={false}
               onBeforeEditorMount={registerSplunkLanguage}
               monacoOptions={{
-                fontSize: 13,
-                lineHeight: LINE_HEIGHT,
+                ariaLabel: 'Splunk Query',
+                fontSize: theme.typography.fontSize,
+                lineHeight,
                 scrollBeyondLastLine: false,
                 wordWrap: 'on',
                 wordWrapColumn: 80,

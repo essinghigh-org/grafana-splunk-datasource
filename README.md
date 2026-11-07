@@ -1,6 +1,6 @@
 # Grafana - Splunk Datasource
 
-![Grafana Splunk Datasource](https://github.com/essinghigh/grafana-splunk-datasource/actions/workflows/ci.yml/badge.svg?branch=main)
+![Grafana Splunk Datasource](https://github.com/essinghigh-org/grafana-splunk-datasource/actions/workflows/ci.yml/badge.svg?branch=main)
 
 > **NOTE >>>**
 >
@@ -48,19 +48,30 @@ by an administrator from Grafana's UI `Configuration --> Datasources --> Add dat
 
 ## Development verification
 
+Use Node.js 24 LTS, Corepack, Yarn 4 (pinned in `package.json`), and Go 1.26.10 or newer. Run `corepack enable` and `yarn install --immutable` before building. Grafana 13.2.0 or newer is supported; local tests use React 19 to match Grafana.
+
 - Use `yarn start` (or `yarn watch`) for local frontend watch builds.
-- Use `yarn server` to launch the local Grafana environment (defaults to `GRAFANA_VERSION=12.0.0`, configurable via env var).
+- Use `yarn server` to launch the local Grafana environment (defaults to `GRAFANA_VERSION=13.3.0`, configurable via env var; exposed at `http://127.0.0.1:3000`).
 - The datasource includes a Go backend. Install Go 1.26.10 or newer before running a complete build; `yarn build` emits the frontend bundle and the platform-specific backend executable consumed by Grafana.
-- Dashboard, Explore, and alert queries are handled by the backend through Grafana's `/api/ds/query` endpoint. Variable queries continue to use the datasource's variable-query support.
+- Dashboard, Explore, and alert queries are handled by the backend through Grafana's `/api/ds/query` endpoint. Variable queries use the same backend, including secure authentication, timeouts, and cancellation.
 - Before opening a PR, run the same checks gated in CI:
 
 ```bash
-go test ./pkg/...
+go test -race ./pkg/...
+go vet ./pkg/...
 yarn lint
 yarn typecheck
-yarn test
+yarn test:ci
 yarn build
 ```
+
+## Browser and release verification
+
+CI runs browser tests against Grafana 13.2.0 and 13.3.0 with a local mock Splunk server. These exercise secure configuration, failed authentication, queries, variables, and Grafana Alerting without requiring a live Splunk deployment.
+
+For local browser tests, run `yarn e2e:mock`, start Grafana with `tests/provisioning` mounted as its provisioning directory and `MOCK_SPLUNK_URL` pointing to the mock (default `http://127.0.0.1:18089`), then run `yarn e2e`. Set `GRAFANA_URL` and `GRAFANA_ADMIN_PASSWORD` to match that test instance. The CI workflow contains a complete Docker startup example.
+
+`yarn build` builds the current platform. `yarn build:release` uses the Grafana SDK to build all six supported backend targets and their Go build manifest. `yarn package` produces ZIP and tar.gz archives under `packages/`, rooted at the plugin ID with executable backend binaries. Release commits retain the `release: ` prefix and commit-hash naming; the release workflow waits for browser tests before publishing.
 
 ## Testing in Grafana:
 

@@ -1,12 +1,14 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,6 +20,7 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/grafana/grafana-plugin-sdk-go/experimental/concurrent"
 )
 
 const (
@@ -30,6 +33,8 @@ const (
 	defaultMaxPages        = 100
 	defaultMaxBytes        = 50 * 1024 * 1024
 	pollInterval           = 100 * time.Millisecond
+	searchCleanupTimeout   = 5 * time.Second
+	queryConcurrency       = 4
 )
 
 type queryModel struct {
@@ -62,19 +67,21 @@ type cachedSearch struct {
 }
 
 type Datasource struct {
-	settings backend.DataSourceInstanceSettings
-	client   *http.Client
-	options  backendOptions
-	standard time.Duration
-	base     time.Duration
-	chain    time.Duration
-	cacheTTL time.Duration
-	maxRows  int
-	maxPages int
-	maxBytes int64
+	settings  backend.DataSourceInstanceSettings
+	client    *http.Client
+	transport *http.Transport
+	options   backendOptions
+	standard  time.Duration
+	base      time.Duration
+	chain     time.Duration
+	cacheTTL  time.Duration
+	maxRows   int
+	maxPages  int
+	maxBytes  int64
 
-	cacheMu sync.Mutex
-	cache   map[string]cachedSearch
+	cacheMu  sync.Mutex
+	cache    map[searchCacheKey]cachedSearch
+	inflight map[searchCacheKey]*baseSearchFlight
 }
 
 func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
@@ -82,6 +89,8 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 	if err != nil {
 		return nil, fmt.Errorf("http client options: %w", err)
 	}
+	clientOptions.ForwardHTTPHeaders = true
+	clientOptions.ConfigureMiddleware = httpclient.ConfigureBasicAuthAfterContextualMiddleware
 
 	// basicAuthToken was present in the original datasource model. Preserve it
 	// for existing provisions while also supporting Grafana's standard basic auth.
@@ -93,11 +102,6 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 		}
 	}
 
-	client, err := httpclient.New(clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("create HTTP client: %w", err)
-	}
-
 	options := backendOptions{}
 	if len(settings.JSONData) > 0 {
 		if err := json.Unmarshal(settings.JSONData, &options); err != nil {
@@ -105,39 +109,60 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 		}
 	}
 
+	// SDK middleware wraps the transport, so retain the underlying connection
+	// pool to close it when Grafana replaces this datasource instance.
+	var transport *http.Transport
+	configureTransport := clientOptions.ConfigureTransport
+	clientOptions.ConfigureTransport = func(options httpclient.Options, configured *http.Transport) {
+		if configureTransport != nil {
+			configureTransport(options, configured)
+		}
+		transport = configured
+	}
+	client, err := httpclient.New(clientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("create HTTP client: %w", err)
+	}
+
 	return &Datasource{
-		settings: settings,
-		client:   client,
-		options:  options,
-		standard: secondsOrDefault(options.StandardSearchTimeoutSeconds, defaultStandardTimeout),
-		base:     secondsOrDefault(options.BaseSearchTimeoutSeconds, defaultBaseTimeout),
-		chain:    secondsOrDefault(options.ChainSearchTimeoutSeconds, defaultChainTimeout),
-		cacheTTL: minutesOrDefault(options.BaseSearchCacheTtlMinutes, defaultCacheTTL),
-		maxRows:  intOrDefault(options.MaxResultRows, defaultMaxRows, 1, 1_000_000),
-		maxPages: intOrDefault(options.MaxResultPages, defaultMaxPages, 1, 1000),
-		maxBytes: int64OrDefault(options.MaxResponseBytes, defaultMaxBytes, 1024, 500*1024*1024),
-		cache:    make(map[string]cachedSearch),
+		settings:  settings,
+		client:    client,
+		transport: transport,
+		options:   options,
+		standard:  secondsOrDefault(options.StandardSearchTimeoutSeconds, defaultStandardTimeout),
+		base:      secondsOrDefault(options.BaseSearchTimeoutSeconds, defaultBaseTimeout),
+		chain:     secondsOrDefault(options.ChainSearchTimeoutSeconds, defaultChainTimeout),
+		cacheTTL:  minutesOrDefault(options.BaseSearchCacheTtlMinutes, defaultCacheTTL),
+		maxRows:   intOrDefault(options.MaxResultRows, defaultMaxRows, 1, 1_000_000),
+		maxPages:  intOrDefault(options.MaxResultPages, defaultMaxPages, 1, 1000),
+		maxBytes:  int64OrDefault(options.MaxResponseBytes, defaultMaxBytes, 1024, 500*1024*1024),
+		cache:     make(map[searchCacheKey]cachedSearch),
 	}, nil
 }
 
 func (d *Datasource) Dispose() {
+	if d.transport != nil {
+		d.transport.CloseIdleConnections()
+	} else if d.client != nil {
+		d.client.CloseIdleConnections()
+	}
 	d.cacheMu.Lock()
 	defer d.cacheMu.Unlock()
-	d.cache = make(map[string]cachedSearch)
+	d.cache = make(map[searchCacheKey]cachedSearch)
 }
 
 func secondsOrDefault(value float64, fallback time.Duration) time.Duration {
 	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
 	}
-	return time.Duration(value * float64(time.Second))
+	return time.Duration(math.Min(3600, math.Max(1, value)) * float64(time.Second))
 }
 
 func minutesOrDefault(value float64, fallback time.Duration) time.Duration {
 	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
 	}
-	return time.Duration(value * float64(time.Minute))
+	return time.Duration(math.Min(60, math.Max(0.1, value)) * float64(time.Minute))
 }
 
 func intOrDefault(value, fallback, minimum, maximum int) int {
@@ -183,8 +208,10 @@ func max64(a, b int64) int64 {
 }
 
 func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, d.standard)
+	defer cancel()
 	form := url.Values{
-		"search":      {"search index=_internal * | stats count"},
+		"search":      {"| makeresults | stats count"},
 		"output_mode": {"json"},
 		"exec_mode":   {"oneshot"},
 	}
@@ -192,9 +219,8 @@ func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequ
 	if err != nil {
 		return &backend.CheckHealthResult{Status: backend.HealthStatusError, Message: err.Error()}, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return &backend.CheckHealthResult{Status: backend.HealthStatusError, Message: responseError(resp)}, nil
+	if _, err := readResponse(resp, d.maxBytes); err != nil {
+		return &backend.CheckHealthResult{Status: backend.HealthStatusError, Message: err.Error()}, nil
 	}
 	return &backend.CheckHealthResult{Status: backend.HealthStatusOk, Message: "Data source is working"}, nil
 }
@@ -202,16 +228,44 @@ func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequ
 func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	response := backend.NewQueryDataResponse()
 	standardQueries, baseQueries, chainQueries := partitionQueries(req.Queries)
+	invalidBases, invalidAliases := validateBaseAliases(baseQueries)
 	baseJobs := make(map[string]cachedSearch)
 
-	for _, query := range standardQueries {
-		response.Responses[query.RefID] = d.queryResponse(ctx, query, req, baseJobs)
+	runIndependent := func(queries []backend.DataQuery) error {
+		stage := *req
+		stage.Queries = queries
+		result, err := concurrent.QueryData(ctx, &stage, func(queryContext context.Context, query concurrent.Query) backend.DataResponse {
+			return d.queryResponse(queryContext, query.DataQuery, req, baseJobs)
+		}, queryConcurrency)
+		if err != nil {
+			return err
+		}
+		for refID, result := range result.Responses {
+			response.Responses[refID] = result
+		}
+		return nil
+	}
+	if err := runIndependent(standardQueries); err != nil {
+		return nil, err
 	}
 	for _, query := range baseQueries {
+		if message, invalid := invalidBases[query.RefID]; invalid {
+			response.Responses[query.RefID] = backend.ErrDataResponseWithSource(backend.StatusBadRequest, backend.ErrorSourcePlugin, message)
+			continue
+		}
 		response.Responses[query.RefID] = d.queryResponse(ctx, query, req, baseJobs)
 	}
+	validChains := make([]backend.DataQuery, 0, len(chainQueries))
 	for _, query := range chainQueries {
-		response.Responses[query.RefID] = d.queryResponse(ctx, query, req, baseJobs)
+		model, err := decodeQuery(query)
+		if err == nil && invalidAliases[model.BaseSearchRefID] {
+			response.Responses[query.RefID] = backend.ErrDataResponseWithSource(backend.StatusBadRequest, backend.ErrorSourcePlugin, fmt.Sprintf("chain search %q refers to ambiguous base search %q", query.RefID, model.BaseSearchRefID))
+			continue
+		}
+		validChains = append(validChains, query)
+	}
+	if err := runIndependent(validChains); err != nil {
+		return nil, err
 	}
 
 	return response, nil
@@ -241,7 +295,42 @@ func decodeQuery(query backend.DataQuery) (queryModel, error) {
 	if err := json.Unmarshal(query.JSON, &model); err != nil {
 		return model, fmt.Errorf("decode query %q: %w", query.RefID, err)
 	}
+	model.SearchID = strings.TrimSpace(model.SearchID)
+	model.BaseSearchRefID = strings.TrimSpace(model.BaseSearchRefID)
 	return model, nil
+}
+
+func validateBaseAliases(queries []backend.DataQuery) (map[string]string, map[string]bool) {
+	owners := make(map[string]int)
+	aliases := make([][]string, len(queries))
+	conflicts := make(map[int]bool)
+	for index, query := range queries {
+		model, err := decodeQuery(query)
+		if err != nil {
+			continue
+		}
+		aliases[index] = []string{query.RefID}
+		if model.SearchID != "" && model.SearchID != query.RefID {
+			aliases[index] = append(aliases[index], model.SearchID)
+		}
+		for _, alias := range aliases[index] {
+			if owner, exists := owners[alias]; exists && owner != index {
+				conflicts[index] = true
+				conflicts[owner] = true
+			} else {
+				owners[alias] = index
+			}
+		}
+	}
+	invalidQueries := make(map[string]string)
+	invalidAliases := make(map[string]bool)
+	for index := range conflicts {
+		invalidQueries[queries[index].RefID] = "Base searches must have unique search IDs and query reference IDs"
+		for _, alias := range aliases[index] {
+			invalidAliases[alias] = true
+		}
+	}
+	return invalidQueries, invalidAliases
 }
 
 func effectiveSearchType(model queryModel) string {
@@ -262,54 +351,96 @@ func (d *Datasource) queryResponse(
 ) backend.DataResponse {
 	model, err := decodeQuery(query)
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, err.Error())
+		return backend.ErrDataResponseWithSource(backend.StatusBadRequest, backend.ErrorSourcePlugin, err.Error())
 	}
 	if strings.TrimSpace(model.QueryText) == "" {
-		return backend.DataResponse{Frames: data.Frames{data.NewFrame(model.QueryText)}}
+		frame := data.NewFrame("response")
+		frame.RefID = query.RefID
+		return backend.DataResponse{Frames: data.Frames{frame}}
 	}
+	timeout := d.standard
+	switch effectiveSearchType(model) {
+	case "base":
+		timeout = d.base
+	case "chain":
+		timeout = d.chain
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	switch effectiveSearchType(model) {
 	case "base":
 		job, err := d.resolveBaseSearch(ctx, query, model, req, baseJobs)
 		if err != nil {
-			return backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+			return queryErrorResponse(err)
 		}
 		if !model.ReturnBaseResults {
-			return backend.DataResponse{Frames: data.Frames{data.NewFrame("base")}}
+			frame := data.NewFrame("base")
+			frame.RefID = query.RefID
+			return backend.DataResponse{Frames: data.Frames{frame}}
 		}
 		result, err := d.getResults(ctx, job.sid, query.RefID)
 		if err != nil {
-			return backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+			return queryErrorResponse(err)
 		}
-		return d.resultResponse(query.RefID, result)
+		return d.resultResponse(query, result, req)
 	case "chain":
 		job, ok := baseJobs[model.BaseSearchRefID]
 		if !ok {
-			job, ok = d.lookupCachedSearch(req, model.BaseSearchRefID, model)
+			job, ok, err = d.waitForCachedSearch(ctx, req, query, model.BaseSearchRefID)
+			if err != nil {
+				return queryErrorResponse(err)
+			}
 		}
 		if !ok {
-			return backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("chain search %q could not resolve base search %q", query.RefID, model.BaseSearchRefID))
+			return backend.ErrDataResponseWithSource(backend.StatusBadRequest, backend.ErrorSourcePlugin, fmt.Sprintf("chain search %q could not resolve base search %q", query.RefID, model.BaseSearchRefID))
 		}
 		result, err := d.runSearch(ctx, query, model, job.sid, d.chain)
 		if err != nil {
-			return backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+			return queryErrorResponse(err)
 		}
-		return d.resultResponse(query.RefID, result.queryResult)
+		return d.resultResponse(query, result.queryResult, req)
 	default:
 		result, err := d.runSearch(ctx, query, model, "", d.standard)
 		if err != nil {
-			return backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+			return queryErrorResponse(err)
 		}
-		return d.resultResponse(query.RefID, result.queryResult)
+		return d.resultResponse(query, result.queryResult, req)
 	}
 }
 
-func (d *Datasource) resultResponse(refID string, result queryResult) backend.DataResponse {
-	frame := result.frame(refID)
+func (d *Datasource) resultResponse(query backend.DataQuery, result queryResult, req *backend.QueryDataRequest) backend.DataResponse {
+	var frame *data.Frame
+	if query.QueryType == "variable" {
+		frame = result.variableFrame(query.RefID)
+	} else if isAlertRequest(req) {
+		var err error
+		frame, err = result.alertingFrame(query.RefID)
+		if err != nil {
+			return backend.ErrDataResponseWithSource(backend.StatusBadRequest, backend.ErrorSourceDownstream, err.Error())
+		}
+	} else {
+		frame = result.frame(query.RefID)
+	}
 	if result.warning != "" {
 		frame.AppendNotices(data.Notice{Severity: data.NoticeSeverityWarning, Text: result.warning, Inspect: data.InspectTypeData})
 	}
 	return backend.DataResponse{Frames: data.Frames{frame}}
+}
+
+func queryErrorResponse(err error) backend.DataResponse {
+	status := backend.StatusBadGateway
+	var responseError *splunkHTTPError
+	var networkError net.Error
+	switch {
+	case errors.As(err, &responseError):
+		status = backend.Status(responseError.status)
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &networkError) && networkError.Timeout():
+		status = backend.StatusTimeout
+	case errors.Is(err, context.Canceled):
+		status = backend.Status(499)
+	}
+	return backend.DataResponse{Error: err, Status: status, ErrorSource: backend.ErrorSourceDownstream}
 }
 
 type queryResult struct {
@@ -328,6 +459,21 @@ func (r queryResult) frame(refID string) *data.Frame {
 
 	for _, field := range r.fields {
 		frame.Fields = append(frame.Fields, newField(field.name, r.rows))
+	}
+	return frame
+}
+
+func (r queryResult) variableFrame(refID string) *data.Frame {
+	frame := data.NewFrame("response")
+	frame.RefID = refID
+	for _, field := range r.fields {
+		values := make([]*string, len(r.rows))
+		for index, row := range r.rows {
+			if value, ok := stringify(row[field.name]); ok {
+				values[index] = &value
+			}
+		}
+		frame.Fields = append(frame.Fields, data.NewField(field.name, nil, values))
 	}
 	return frame
 }
@@ -428,82 +574,6 @@ func parseTime(value interface{}) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func (d *Datasource) resolveBaseSearch(
-	ctx context.Context,
-	query backend.DataQuery,
-	model queryModel,
-	req *backend.QueryDataRequest,
-	baseJobs map[string]cachedSearch,
-) (cachedSearch, error) {
-	identifier := model.SearchID
-	if identifier == "" {
-		identifier = query.RefID
-	}
-	key := d.cacheKey(req, query, model, identifier)
-	if job, ok := d.getCached(key); ok {
-		baseJobs[identifier] = job
-		baseJobs[query.RefID] = job
-		return job, nil
-	}
-
-	sid, err := d.startSearch(ctx, query, model, "", d.base)
-	if err != nil {
-		return cachedSearch{}, err
-	}
-	job := cachedSearch{sid: sid, searchID: identifier, refID: query.RefID, createdAt: time.Now()}
-	d.putCached(key, job)
-	baseJobs[identifier] = job
-	baseJobs[query.RefID] = job
-	return job, nil
-}
-
-func (d *Datasource) cacheKey(req *backend.QueryDataRequest, query backend.DataQuery, model queryModel, identifier string) string {
-	rangeKey := query.TimeRange.From.String() + "|" + query.TimeRange.To.String()
-	if model.UseDashboardTimeRange != nil && !*model.UseDashboardTimeRange {
-		rangeKey = model.Earliest + "|" + model.Latest
-	}
-	return strings.Join([]string{dashboardNamespace(req), identifier, model.QueryText, rangeKey}, "|")
-}
-
-func dashboardNamespace(req *backend.QueryDataRequest) string {
-	namespace := req.GetHTTPHeader("X-Dashboard-Uid")
-	if namespace == "" {
-		namespace = req.GetHTTPHeader("X-Dashboard-Title")
-	}
-	if namespace == "" {
-		namespace = "unknown-dashboard"
-	}
-	return namespace
-}
-
-func (d *Datasource) getCached(key string) (cachedSearch, bool) {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
-	job, ok := d.cache[key]
-	if !ok || time.Since(job.createdAt) >= d.cacheTTL {
-		delete(d.cache, key)
-		return cachedSearch{}, false
-	}
-	return job, true
-}
-
-func (d *Datasource) putCached(key string, job cachedSearch) {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
-	d.cache[key] = job
-}
-
-func (d *Datasource) lookupCachedSearch(req *backend.QueryDataRequest, identifier string, model queryModel) (cachedSearch, bool) {
-	d.cacheMu.Lock()
-	defer d.cacheMu.Unlock()
-	for key, job := range d.cache {
-		if job.searchID == identifier && time.Since(job.createdAt) < d.cacheTTL && strings.HasPrefix(key, dashboardNamespace(req)+"|") {
-			return job, true
-		}
-	}
-	return cachedSearch{}, false
-}
-
 func (d *Datasource) runSearch(ctx context.Context, query backend.DataQuery, model queryModel, baseSID string, timeout time.Duration) (queryResultWithSID, error) {
 	if len(strings.TrimSpace(model.QueryText)) < 1 {
 		return queryResultWithSID{queryResult: queryResult{}}, nil
@@ -515,7 +585,7 @@ func (d *Datasource) runSearch(ctx context.Context, query backend.DataQuery, mod
 	}
 	result, err := d.getResults(ctx, sid, query.RefID)
 	if err != nil {
-		_ = d.cancelSearch(ctx, sid)
+		d.cancelFailedSearch(ctx, sid)
 		return queryResultWithSID{}, err
 	}
 	return queryResultWithSID{queryResult: result, sid: sid}, nil
@@ -561,11 +631,11 @@ func (d *Datasource) startSearch(ctx context.Context, query backend.DataQuery, m
 
 	status, err := d.waitForCompletion(ctx, creation.SID, timeout)
 	if err != nil {
-		_ = d.cancelSearch(ctx, creation.SID)
+		d.cancelFailedSearch(ctx, creation.SID)
 		return "", err
 	}
 	if status.state == "FAILED" {
-		_ = d.cancelSearch(ctx, creation.SID)
+		d.cancelFailedSearch(ctx, creation.SID)
 		return "", fmt.Errorf("Splunk search failed (sid=%s): %s", creation.SID, strings.Join(status.messages, "; "))
 	}
 	return creation.SID, nil
@@ -593,7 +663,7 @@ func (d *Datasource) waitForCompletion(ctx context.Context, sid string, timeout 
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return status, fmt.Errorf("Splunk search timed out after %s (sid=%s)", timeout, sid)
+			return status, fmt.Errorf("Splunk search timed out after %s (sid=%s): %w", timeout, sid, context.DeadlineExceeded)
 		}
 		select {
 		case <-ctx.Done():
@@ -672,6 +742,14 @@ func (d *Datasource) cancelSearch(ctx context.Context, sid string) error {
 	return nil
 }
 
+func (d *Datasource) cancelFailedSearch(ctx context.Context, sid string) {
+	// A cancelled Grafana request must still stop its remote job. Preserve request
+	// values (including forwarded authentication), with a separate bounded deadline.
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), searchCleanupTimeout)
+	defer cancel()
+	_ = d.cancelSearch(cleanup, sid)
+}
+
 func (d *Datasource) getResults(ctx context.Context, sid, refID string) (queryResult, error) {
 	result := queryResult{}
 	offset := 0
@@ -704,7 +782,9 @@ func (d *Datasource) getResults(ctx context.Context, sid, refID string) (queryRe
 			} `json:"fields"`
 			Results []map[string]interface{} `json:"results"`
 		}
-		if err := json.Unmarshal(body, &pageBody); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.UseNumber()
+		if err := decoder.Decode(&pageBody); err != nil {
 			return result, fmt.Errorf("decode Splunk results: %w", err)
 		}
 		if len(result.fields) == 0 {
@@ -727,6 +807,9 @@ func (d *Datasource) getResults(ctx context.Context, sid, refID string) (queryRe
 		}
 		if len(pageBody.Results) < count {
 			break
+		}
+		if page+1 == d.maxPages {
+			result.warning = fmt.Sprintf("Splunk results truncated at the configured page limit (%d).", d.maxPages)
 		}
 	}
 	if len(result.rows) >= d.maxRows && result.warning == "" {
@@ -770,9 +853,18 @@ func (d *Datasource) doRequest(ctx context.Context, method, path string, body io
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message := responseError(response)
 		response.Body.Close()
-		return nil, fmt.Errorf("Splunk returned HTTP %d: %s", response.StatusCode, message)
+		return nil, &splunkHTTPError{status: response.StatusCode, message: message}
 	}
 	return response, nil
+}
+
+type splunkHTTPError struct {
+	status  int
+	message string
+}
+
+func (err *splunkHTTPError) Error() string {
+	return fmt.Sprintf("Splunk returned HTTP %d: %s", err.status, err.message)
 }
 
 func (d *Datasource) doFormRequest(ctx context.Context, method, path string, values url.Values) (*http.Response, error) {
@@ -812,3 +904,4 @@ func responseError(response *http.Response) string {
 
 var _ backend.QueryDataHandler = (*Datasource)(nil)
 var _ backend.CheckHealthHandler = (*Datasource)(nil)
+var _ instancemgmt.InstanceDisposer = (*Datasource)(nil)

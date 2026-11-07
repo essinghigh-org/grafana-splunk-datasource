@@ -1,19 +1,21 @@
 {
   "$schema": "https://raw.githubusercontent.com/grafana/grafana/master/docs/sources/developers/plugins/plugin.schema.json",
   "type": "datasource",
-  "name": "splunk-datasource",
+  "name": "Splunk",
   "id": "essinghigh-splunk-datasource",
   "backend": true,
   "executable": "essinghigh-splunk-datasource",
   "metrics": true,
   "info": {
-    "description": "",
+    "description": "Query Splunk from Grafana dashboards, Explore, variables, and alerting.",
     "author": {
       "name": "Henry Essinghigh",
       "url": "https://essinghigh.dev",
       "email": "henry@essinghigh.dev"
     },
-    "keywords": ["splunk"],
+    "keywords": [
+      "splunk"
+    ],
     "logos": {
       "small": "img/logo.svg",
       "large": "img/logo.svg"
@@ -21,11 +23,11 @@
     "links": [
       {
         "name": "Website",
-        "url": "https://github.com/essinghigh/grafana-splunk-datasource"
+        "url": "https://github.com/essinghigh-org/grafana-splunk-datasource"
       },
       {
         "name": "License",
-        "url": "https://github.com/essinghigh/grafana-splunk-datasource/blob/main/LICENSE"
+        "url": "https://github.com/essinghigh-org/grafana-splunk-datasource/blob/main/LICENSE"
       }
     ],
     "screenshots": [],
@@ -33,7 +35,9 @@
     "updated": "%TODAY%"
   },
   "dependencies": {
-    "grafanaDependency": ">=13.0.0",
+    "grafanaDependency": ">=13.2.0",
     "plugins": []
-  }
+  },
+  "category": "logging",
+  "alerting": true
 }

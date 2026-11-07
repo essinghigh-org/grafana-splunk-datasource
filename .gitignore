@@ -3,6 +3,14 @@
 coverage/
 dist/
 node_modules/
+.yarn/
+.playwright-cli/
+playwright/.auth/
+playwright-report/
+test-results/
+packages/*.zip
+packages/*.tar.gz
+plugin-dist.tar
 go_plugin_build_manifest
 *~
 \#*

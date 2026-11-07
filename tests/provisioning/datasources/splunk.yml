@@ -1,0 +1,25 @@
+apiVersion: 1
+
+datasources:
+  - name: Splunk E2E
+    uid: splunk-e2e
+    type: essinghigh-splunk-datasource
+    access: proxy
+    url: $MOCK_SPLUNK_URL
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      standardSearchTimeoutSeconds: 5
+    secureJsonData:
+      httpHeaderValue1: Bearer grafana-e2e-token
+  - name: Splunk E2E invalid credentials
+    uid: splunk-e2e-invalid
+    type: essinghigh-splunk-datasource
+    access: proxy
+    url: $MOCK_SPLUNK_URL
+    editable: true
+    jsonData:
+      httpHeaderName1: Authorization
+      standardSearchTimeoutSeconds: 5
+    secureJsonData:
+      httpHeaderValue1: Bearer invalid-e2e-token

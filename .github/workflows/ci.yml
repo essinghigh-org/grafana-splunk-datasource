@@ -19,27 +19,28 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: ')) }}"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20.x'
-          cache: 'yarn'
+          node-version-file: .nvmrc
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
           cache: true
 
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: yarn install --immutable
 
       - name: Lint
         run: yarn lint
@@ -48,39 +49,115 @@ jobs:
         run: yarn typecheck
 
       - name: Backend tests
-        run: go test ./pkg/...
+        run: go test -race ./pkg/...
+
+      - name: Backend vet
+        run: go vet ./pkg/...
 
       - name: Build plugin
-        run: yarn build
+        run: |
+          if [ "$RELEASE_BUILD" = true ]; then
+            yarn build:release
+          else
+            yarn build
+          fi
+          tar -cf plugin-dist.tar -C dist .
+        env:
+          RELEASE_BUILD: "${{ github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release: ') }}"
 
       - name: Run tests
-        run: yarn test
+        run: yarn test:ci
 
       - name: Upload plugin build
-        if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: ') }}"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: plugin-dist
-          path: dist
+          path: plugin-dist.tar
           retention-days: 1
 
-  release:
+  e2e:
     needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        grafana: ['13.2.0', '13.3.0']
+    env:
+      GRAFANA_URL: http://127.0.0.1:13003
+      GRAFANA_ADMIN_PASSWORD: e2e-admin-password
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable
+      - run: yarn install --immutable
+      - run: yarn playwright install --with-deps chromium
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plugin-dist
+      - name: Restore plugin build
+        run: mkdir -p dist && tar -xf plugin-dist.tar -C dist
+      - name: Start test services
+        env:
+          GRAFANA_VERSION: ${{ matrix.grafana }}
+        run: |
+          node scripts/mock-splunk.mjs > /tmp/mock-splunk.log 2>&1 &
+          docker run -d --name grafana-e2e --network host \
+            -e GF_SERVER_HTTP_ADDR=127.0.0.1 -e GF_SERVER_HTTP_PORT=13003 \
+            -e GF_SECURITY_ADMIN_PASSWORD="$GRAFANA_ADMIN_PASSWORD" \
+            -e GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=essinghigh-splunk-datasource \
+            -e MOCK_SPLUNK_URL=http://127.0.0.1:18089 \
+            -v "$PWD/dist:/var/lib/grafana/plugins/essinghigh-splunk-datasource:ro" \
+            -v "$PWD/tests/provisioning:/etc/grafana/provisioning:ro" \
+            "grafana/grafana:$GRAFANA_VERSION"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent "$GRAFANA_URL/api/health"; then exit 0; fi
+            sleep 2
+          done
+          docker logs grafana-e2e
+          exit 1
+      - run: yarn e2e
+      - name: Test service logs
+        if: failure()
+        run: docker logs grafana-e2e; cat /tmp/mock-splunk.log
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-traces-${{ matrix.grafana }}
+          path: test-results
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Stop Grafana
+        if: always()
+        run: docker rm -f grafana-e2e
+
+  release:
+    needs: [build, e2e]
     if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: ') }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Download plugin build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: plugin-dist
-          path: dist
+
+      - name: Restore plugin build
+        run: mkdir -p dist && tar -xf plugin-dist.tar -C dist
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
 
       - name: Create Release with Commit Hash
         env:

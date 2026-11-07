@@ -1,87 +1,42 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Get the short commit hash
-COMMIT_HASH=$(git rev-parse --short HEAD)
-FULL_COMMIT_HASH=$(git rev-parse HEAD)
+set -euo pipefail
 
-echo "Creating release with tag: $COMMIT_HASH"
+commit_hash=$(git rev-parse --short HEAD)
+full_commit_hash=$(git rev-parse HEAD)
 
-# Check if tag already exists (using git tag to verify)
-if git tag | grep -q "^$COMMIT_HASH$"; then
-    echo "Tag $COMMIT_HASH already exists, skipping release creation"
+if tag_commit=$(git rev-parse --verify --quiet "refs/tags/$commit_hash^{commit}"); then
+  if [ "$tag_commit" != "$full_commit_hash" ]; then
+    printf 'Tag %s points to a different commit; refusing to publish.\n' "$commit_hash" >&2
+    exit 1
+  fi
+  if gh release view "$commit_hash" >/dev/null 2>&1; then
+    printf 'Release %s already exists, skipping release creation.\n' "$commit_hash"
     exit 0
-else
-    echo "Tag $COMMIT_HASH does not exist, proceeding with release"
+  fi
 fi
 
-# Update changelog
-echo "Updating changelog..."
 ./scripts/update-changelog.sh
+./scripts/package-plugin.sh "$commit_hash"
+plugin_id=$(node -p 'require("./dist/plugin.json").id')
 
-# Create the tarball
-echo "Creating tarball..."
-# Check if dist directory exists
-if [ ! -d "dist" ]; then
-    echo "Error: dist directory not found. Build the plugin first."
-    exit 1
-fi
-mv dist essinghigh-splunk-datasource
-echo "Creating tarball: essinghigh-splunk-datasource-$COMMIT_HASH.tar.gz"
-tar -czvf "essinghigh-splunk-datasource-$COMMIT_HASH.tar.gz" essinghigh-splunk-datasource
-# Verify the tarball was created
-if [ ! -f "essinghigh-splunk-datasource-$COMMIT_HASH.tar.gz" ]; then
-    echo "Error: Failed to create tarball"
-    exit 1
-fi
+release_notes=$(mktemp "${TMPDIR:-/tmp}/grafana-plugin-release.XXXXXX")
+trap 'rm -f "$release_notes"' EXIT
+cat > "$release_notes" <<EOF
+Release $commit_hash
 
-# Get commit message for release notes
-COMMIT_MESSAGE=$(git log -1 --pretty=%B)
-
-# Create release notes
-cat > release_notes.md << EOF
-Release $COMMIT_HASH
-
-Commit: $FULL_COMMIT_HASH
+Commit: $full_commit_hash
 
 ### Changes
-$COMMIT_MESSAGE
+$(git log -1 --pretty=%B)
 EOF
 
-echo "Release notes:"
-cat release_notes.md
+gh release create "$commit_hash" \
+  "packages/$plugin_id-$commit_hash.zip" \
+  "packages/$plugin_id-$commit_hash.tar.gz" \
+  --target "$full_commit_hash" \
+  --title "Release $commit_hash" \
+  --notes-file "$release_notes" \
+  --generate-notes
 
-# Create the release using GitHub CLI
-gh release create "$COMMIT_HASH" \
-    "essinghigh-splunk-datasource-$COMMIT_HASH.tar.gz" \
-    --title "Release $COMMIT_HASH" \
-    --notes-file release_notes.md \
-    --generate-notes
-
-echo "Release $COMMIT_HASH created successfully"
-
-# Commit the updated changelog
-if [ -n "$(git status --porcelain CHANGELOG.md)" ]; then
-    echo "Committing updated changelog..."
-    
-    # Configure git (required for GitHub Actions)
-    git config --local user.email "action@github.com"
-    git config --local user.name "GitHub Action"
-    
-    # Add and commit
-    git add CHANGELOG.md
-    git commit -m "Update changelog for release $COMMIT_HASH"
-    
-    # If running in GitHub Actions, handle authentication for push
-    if [ -n "$GITHUB_ACTIONS" ]; then
-        echo "Setting up authentication for GitHub Actions"
-        # Use the GITHUB_TOKEN to authenticate the push
-        # This changes the remote URL to include the token
-        git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-        echo "Pushing changes using GitHub Actions token"
-        git push origin HEAD:${GITHUB_REF#refs/heads/}
-    else
-        # For local testing
-        echo "Pushing changes"
-        git push
-    fi
-fi
+printf 'Release %s created successfully.\n' "$commit_hash"
