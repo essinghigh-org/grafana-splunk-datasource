@@ -95,7 +95,11 @@
   "resolutions": {
     "dompurify": "3.4.17",
     "copy-webpack-plugin/serialize-javascript": "7.1.4",
-    "moment": "2.31.0"
+    "moment": "2.31.0",
+    "@jest/reporters/glob": "14.0.4",
+    "test-exclude/glob": "14.0.4",
+    "jest-config/glob": "14.0.4",
+    "jest-runtime/glob": "14.0.4"
   },
   "packageManager": "yarn@4.18.1"
 }
