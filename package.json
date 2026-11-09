@@ -24,7 +24,7 @@
   "author": "essinghigh (henry@essinghigh.dev)",
   "license": "MIT",
   "devDependencies": {
-    "@axe-core/playwright": "4.11.1",
+    "@axe-core/playwright": "4.14.0",
     "@grafana/e2e-selectors": "13.3.0",
     "@grafana/eslint-config": "9.0.0",
     "@grafana/plugin-e2e": "4.0.0",
@@ -33,7 +33,7 @@
     "@stylistic/eslint-plugin": "^2.12.1",
     "@stylistic/eslint-plugin-ts": "^2.9.0",
     "@swc/core": "^1.16.21",
-    "@swc/helpers": "^0.5.0",
+    "@swc/helpers": "^0.5.24",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
@@ -64,7 +64,7 @@
     "prettier": "^3.9.10",
     "replace-in-file-webpack-plugin": "^1.0.6",
     "rxjs": "7.8.2",
-    "sass": "1.107.1",
+    "sass": "1.108.0",
     "sass-loader": "17.1.0",
     "serialize-javascript": "7.1.4",
     "style-loader": "4.0.0",
@@ -89,8 +89,8 @@
     "@grafana/runtime": "13.3.0",
     "@grafana/schema": "13.3.0",
     "@grafana/ui": "13.3.0",
-    "react": "19.2.9",
-    "react-dom": "19.2.9"
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "resolutions": {
     "dompurify": "3.4.17",
