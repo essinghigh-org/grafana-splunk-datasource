@@ -1,6 +1,6 @@
 {
   "name": "essinghigh-splunk-datasource",
-  "version": "0.2.0",
+  "version": "1.8.0",
   "description": "Query Splunk from Grafana dashboards, Explore, variables, and alerting.",
   "scripts": {
     "build": "yarn build:frontend && yarn build:backend",
