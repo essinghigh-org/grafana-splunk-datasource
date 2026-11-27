@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
   pull_request:
     branches:
       - main
@@ -30,8 +32,17 @@ jobs:
         with:
           node-version-file: .nvmrc
 
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "${RELEASE_TAG#v}" = "$(node -p 'require("./package.json").version')"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.26.x'
           cache: true
@@ -56,14 +67,23 @@ jobs:
 
       - name: Build plugin
         run: |
-          if [ "$RELEASE_BUILD" = true ]; then
-            yarn build:release
-          else
-            yarn build
-          fi
+          yarn build:release
+          test -s dist/essinghigh-splunk-datasource_windows_amd64.exe
           tar -cf plugin-dist.tar -C dist .
-        env:
-          RELEASE_BUILD: "${{ github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release: ') }}"
+
+      - name: Verify release archives
+        run: |
+          ./scripts/package-plugin.sh ci
+          unzip -Z1 packages/essinghigh-splunk-datasource-ci-windows.zip | grep -Fx 'essinghigh-splunk-datasource/essinghigh-splunk-datasource_windows_amd64.exe'
+          for arch in amd64 arm arm64; do
+            tar -tzf packages/essinghigh-splunk-datasource-ci-linux.tar.gz | grep -Fx "essinghigh-splunk-datasource/essinghigh-splunk-datasource_linux_$arch"
+          done
+          for arch in amd64 arm64; do
+            tar -tzf packages/essinghigh-splunk-datasource-ci-darwin.tar.gz | grep -Fx "essinghigh-splunk-datasource/essinghigh-splunk-datasource_darwin_$arch"
+          done
+          ! unzip -Z1 packages/essinghigh-splunk-datasource-ci-windows.zip | grep -E 'essinghigh-splunk-datasource_(linux|darwin)_'
+          ! tar -tzf packages/essinghigh-splunk-datasource-ci-linux.tar.gz | grep -E 'essinghigh-splunk-datasource_(windows|darwin)_'
+          ! tar -tzf packages/essinghigh-splunk-datasource-ci-darwin.tar.gz | grep -E 'essinghigh-splunk-datasource_(linux|windows)_'
 
       - name: Run tests
         run: yarn test:ci
@@ -74,6 +94,17 @@ jobs:
           name: plugin-dist
           path: plugin-dist.tar
           retention-days: 1
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Test backend on Windows
+        run: go test ./pkg/...
 
   e2e:
     needs: build
@@ -135,8 +166,8 @@ jobs:
         run: docker rm -f grafana-e2e
 
   release:
-    needs: [build, e2e]
-    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: ') }}"
+    needs: [build, windows, e2e]
+    if: "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -159,7 +190,7 @@ jobs:
         with:
           node-version-file: .nvmrc
 
-      - name: Create Release with Commit Hash
+      - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/create-release.sh
